@@ -15,7 +15,7 @@ export const HotelProvider = ({ children }) => {
 
   const fetchTables = async () => {
     try {
-      const res = await fetch("http://localhost:5000/tables");
+      const res = await fetch("https://five0-50-chinese-fast-food-6.onrender.com/tables");
       const data = await res.json();
       setTables(data);
     } catch (err) {
@@ -102,7 +102,7 @@ export const HotelProvider = ({ children }) => {
     }
 
     try {
-      const res = await fetch("http://localhost:5000/orders", {
+      const res = await fetch("https://five0-50-chinese-fast-food-6.onrender.com/orders", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -149,12 +149,12 @@ export const HotelProvider = ({ children }) => {
   /* ================= ORDER FETCH ================= */
 
   const fetchOrders = async () => {
-    const res = await fetch("http://localhost:5000/orders");
+    const res = await fetch("https://five0-50-chinese-fast-food-6.onrender.com/orders");
     return await res.json();
   };
 
   const updateOrderStatus = async (orderId, status) => {
-    await fetch(`http://localhost:5000/orders/${orderId}`, {
+    await fetch(`https://five0-50-chinese-fast-food-6.onrender.com/orders/${orderId}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ status }),
@@ -163,7 +163,7 @@ export const HotelProvider = ({ children }) => {
 
   const markAsPaid = async (orderId) => {
     await fetch(
-      `http://localhost:5000/orders/${orderId}/pay`,
+      `https://five0-50-chinese-fast-food-6.onrender.com/orders/${orderId}/pay`,
       { method: "PUT" }
     );
     fetchTables();
