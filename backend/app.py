@@ -19,7 +19,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_caching import Cache
 
-from database import get_connection
+from database import get_connection, release_connection
 from init_db import initialize_database
 
 
@@ -56,7 +56,7 @@ limiter = Limiter(
 socketio = SocketIO(
     app,
     cors_allowed_origins=FRONTEND_URL,
-    async_mode="eventlet",          # ✅ faster than threading
+    async_mode="eventlet",
     ping_timeout=20,
     ping_interval=10,
 )
@@ -73,6 +73,7 @@ initialize_database()
 # ============================================================
 
 def parse_items(rows):
+    """Convert items JSON string to list for each order row."""
     for row in rows:
         row["items"] = json.loads(row["items"]) if row.get("items") else []
     return rows
@@ -91,7 +92,7 @@ def get_tables():
         cursor.execute("SELECT * FROM tables")
         return jsonify(cursor.fetchall())
     finally:
-        conn.close()
+        release_connection(conn)
 
 
 @app.route("/tables/<int:table_id>", methods=["PUT"])
@@ -110,7 +111,7 @@ def update_table_status(table_id):
         socketio.emit("table_updated", {"table_id": table_id}, broadcast=True)
         return jsonify({"message": "Table status updated"})
     finally:
-        conn.close()
+        release_connection(conn)
 
 
 # ============================================================
@@ -145,7 +146,10 @@ def create_order():
             session_id,
         ))
 
-        cursor.execute("UPDATE tables SET status='reserved' WHERE id=%s", (data.get("table_id"),))
+        cursor.execute(
+            "UPDATE tables SET status='reserved' WHERE id=%s",
+            (data.get("table_id"),)
+        )
         conn.commit()
 
         cache.delete_many("all_tables", "total_income")
@@ -159,7 +163,7 @@ def create_order():
         return jsonify({"error": str(e)}), 500
     finally:
         if conn:
-            conn.close()
+            release_connection(conn)
 
 
 @app.route("/orders", methods=["GET"])
@@ -172,7 +176,7 @@ def get_orders():
         cursor.execute("SELECT * FROM orders ORDER BY created_at DESC")
         return jsonify(parse_items(cursor.fetchall()))
     finally:
-        conn.close()
+        release_connection(conn)
 
 
 @app.route("/orders/session/<session_id>", methods=["GET"])
@@ -189,7 +193,7 @@ def get_session_orders(session_id):
         """, (session_id,))
         return jsonify(parse_items(cursor.fetchall()))
     finally:
-        conn.close()
+        release_connection(conn)
 
 
 @app.route("/orders/table/<int:table_id>", methods=["GET"])
@@ -210,7 +214,7 @@ def get_orders_by_table(table_id):
         """, (table_id, session_id))
         return jsonify(parse_items(cursor.fetchall()))
     finally:
-        conn.close()
+        release_connection(conn)
 
 
 @app.route("/orders/<int:order_id>", methods=["PUT"])
@@ -223,13 +227,16 @@ def update_order_status(order_id):
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute("UPDATE orders SET status=%s WHERE id=%s", (data["status"], order_id))
+        cursor.execute(
+            "UPDATE orders SET status=%s WHERE id=%s",
+            (data["status"], order_id)
+        )
         conn.commit()
         cache.delete("all_orders")
         socketio.emit("order_updated", {"order_id": order_id}, broadcast=True)
         return jsonify({"message": "Status updated"})
     finally:
-        conn.close()
+        release_connection(conn)
 
 
 @app.route("/orders/<int:order_id>/pay", methods=["PUT"])
@@ -256,7 +263,7 @@ def mark_paid(order_id):
 
         return jsonify({"message": "Order paid & table freed"})
     finally:
-        conn.close()
+        release_connection(conn)
 
 
 # ============================================================
@@ -272,9 +279,9 @@ def total_income():
         cursor = conn.cursor()
         cursor.execute("SELECT SUM(total) AS income FROM orders WHERE status='paid'")
         row = cursor.fetchone()
-        return jsonify({"total_income": row["income"] if row and row["income"] else 0})
+        return jsonify({"total_income": float(row["income"]) if row and row["income"] else 0})
     finally:
-        conn.close()
+        release_connection(conn)
 
 
 # ============================================================
