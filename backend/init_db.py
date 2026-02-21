@@ -1,5 +1,5 @@
 def initialize_database():
-    from database import get_connection
+    from database import get_connection, release_connection
     from werkzeug.security import generate_password_hash
 
     conn = get_connection()
@@ -7,7 +7,7 @@ def initialize_database():
         cursor = conn.cursor()
 
         # ============================================================
-        #                        TABLES
+        #                        CREATE TABLES
         # ============================================================
 
         cursor.execute("""
@@ -41,10 +41,9 @@ def initialize_database():
         """)
 
         # ============================================================
-        #              INDEXES — dramatically speeds up lookups
+        #              INDEXES — speeds up frequent lookups
         # ============================================================
 
-        # Orders are frequently filtered by session_id and table_id
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_orders_session_id
             ON orders (session_id)
@@ -53,14 +52,13 @@ def initialize_database():
             CREATE INDEX IF NOT EXISTS idx_orders_table_session
             ON orders (table_id, session_id)
         """)
-        # Income query filters by status='paid'
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_orders_status
             ON orders (status)
         """)
 
         # ============================================================
-        #                     SEED DATA
+        #                        SEED DATA
         # ============================================================
 
         cursor.execute("SELECT COUNT(*) FROM tables")
@@ -81,4 +79,4 @@ def initialize_database():
         conn.commit()
 
     finally:
-        conn.close()
+        release_connection(conn)
