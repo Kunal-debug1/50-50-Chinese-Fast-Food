@@ -7,6 +7,5 @@ flask-caching==2.3.0
 apscheduler==3.10.4
 Werkzeug==3.0.3
 gunicorn==22.0.0
-psycopg[binary,pool]
+psycopg[binary,pool]==3.1.18
 eventlet==0.36.1
-
