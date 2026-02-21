@@ -36,7 +36,7 @@ limiter = Limiter(
     default_limits=["200 per day", "50 per hour"]
 )
 
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://five0-50-chinese-fast-food-frontend.onrender.com")
 
 CORS(
     app,
