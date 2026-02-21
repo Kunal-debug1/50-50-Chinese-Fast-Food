@@ -1,7 +1,6 @@
 import os
-from psycopg.pool import ConnectionPool
+from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
-
 
 # ============================================================
 #              CONNECTION POOL (created once at startup)
