@@ -27,13 +27,13 @@ function AdminDashboard() {
   /* ================= FETCH FUNCTIONS ================= */
 
   const fetchTables = async () => {
-    const res = await fetch("http://localhost:5000/tables");
+    const res = await fetch("https://five0-50-chinese-fast-food-6.onrender.com/tables");
     const data = await res.json();
     setTables(data);
   };
 
   const fetchOrders = async () => {
-    const res = await fetch("http://localhost:5000/orders", {
+    const res = await fetch("https://five0-50-chinese-fast-food-6.onrender.com/orders", {
       headers: {
         Authorization: "Bearer " + token,
       },
@@ -49,7 +49,7 @@ function AdminDashboard() {
   };
 
   const fetchIncome = async () => {
-    const res = await fetch("http://localhost:5000/income", {
+    const res = await fetch("https://five0-50-chinese-fast-food-6.onrender.com/income", {
       headers: {
         Authorization: "Bearer " + token,
       },
@@ -67,7 +67,7 @@ function AdminDashboard() {
   /* ================= WEBSOCKET ================= */
 
   useEffect(() => {
-    const socket = io("http://localhost:5000");
+    const socket = io("https://five0-50-chinese-fast-food-6.onrender.com");
 
     socket.on("new_order", () => {
       fetchOrders();
@@ -109,7 +109,7 @@ function AdminDashboard() {
   /* ================= ORDER ACTIONS ================= */
 
   const updateOrderStatus = async (orderId, status) => {
-    await fetch(`http://localhost:5000/orders/${orderId}`, {
+    await fetch(`https://five0-50-chinese-fast-food-6.onrender.com/orders/${orderId}`, {
       method: "PUT",
       headers: {
         "Content-Type": "application/json",
@@ -121,7 +121,7 @@ function AdminDashboard() {
   };
 
   const markAsPaid = async (orderId) => {
-    await fetch(`http://localhost:5000/orders/${orderId}/pay`, {
+    await fetch(`https://five0-50-chinese-fast-food-6.onrender.com/orders/${orderId}/pay`, {
       method: "PUT",
       headers: {
         Authorization: "Bearer " + token,
