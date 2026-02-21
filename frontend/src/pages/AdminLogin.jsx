@@ -18,7 +18,7 @@ function AdminLogin() {
       setLoading(true);
       setError("");
 
-      const res = await fetch("http://localhost:5000/admin/login", {
+      const res = await fetch("https://five0-50-chinese-fast-food-6.onrender.com/admin/login", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
