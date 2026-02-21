@@ -330,7 +330,7 @@ scheduler.start()
 
 @app.route("/init-db")
 def init_db_route():
-    from init_db import *
+    import init_db
     return "Database initialized"
 
 
