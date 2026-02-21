@@ -7,6 +7,7 @@ from psycopg.rows import dict_row
 # ============================================================
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+
 if not DATABASE_URL:
     raise Exception("DATABASE_URL environment variable not set")
 
@@ -16,11 +17,17 @@ pool = ConnectionPool(
     conninfo=DATABASE_URL,
     min_size=2,
     max_size=10,
-    kwargs={"row_factory": dict_row},
-    open=True,
+    kwargs={
+        "row_factory": dict_row
+    },
+    open=True
 )
 
 
 def get_connection():
-    """Return a connection from the pool (auto-returned on conn.close())."""
+    """
+    Return a connection from the pool.
+    The connection is automatically returned to the pool
+    when conn.close() is called.
+    """
     return pool.getconn()
