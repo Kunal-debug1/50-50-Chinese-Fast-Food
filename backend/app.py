@@ -298,8 +298,8 @@ def admin_login():
     password = data.get("password")
     
     # ✅ Hardcoded admin credentials (replace with database in production)
-    ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-    ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "1234")
+    ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "SHUBHAM")
+    ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "8830146272")
     
     if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
         access_token = create_access_token(identity=username)
