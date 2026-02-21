@@ -3,10 +3,11 @@
 # ============================================================
 
 import os
+import json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from database import get_connection
-import json
+from init_db import initialize_database
 
 from flask_jwt_extended import (
     JWTManager,
@@ -17,7 +18,6 @@ from flask_jwt_extended import (
 from flask_socketio import SocketIO
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
-from apscheduler.schedulers.background import BackgroundScheduler
 from werkzeug.security import check_password_hash
 
 
@@ -26,6 +26,9 @@ from werkzeug.security import check_password_hash
 # ============================================================
 
 app = Flask(__name__)
+
+# 🔥 Initialize database automatically on startup
+initialize_database()
 
 limiter = Limiter(
     get_remote_address,
@@ -48,6 +51,7 @@ socketio = SocketIO(
     app,
     cors_allowed_origins=FRONTEND_URL,
 )
+
 
 # ============================================================
 #                        ROUTES
@@ -107,7 +111,6 @@ def create_order():
     except Exception as e:
         if conn:
             conn.rollback()
-        print("ORDER ERROR:", e)
         return jsonify({"error": str(e)}), 500
 
     finally:
@@ -271,8 +274,10 @@ def total_income():
     finally:
         conn.close()
 
-@app.route("/force-init")
-def force_init():
-    from init_db import initialize_database
-    initialize_database()
-    return "Database initialized again"
+
+# ============================================================
+#                        RUN LOCAL
+# ============================================================
+
+if __name__ == "__main__":
+    app.run(debug=True)
