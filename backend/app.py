@@ -270,3 +270,9 @@ def total_income():
         })
     finally:
         conn.close()
+
+@app.route("/force-init")
+def force_init():
+    from init_db import initialize_database
+    initialize_database()
+    return "Database initialized again"
