@@ -36,7 +36,8 @@ limiter = Limiter(
     default_limits=["200 per day", "50 per hour"]
 )
 
-FRONTEND_URL = os.getenv("FRONTEND_URL", "https://five0-50-chinese-fast-food-frontend.onrender.com")
+# ✅ Updated frontend URL for Render deployment
+FRONTEND_URL = os.getenv("FRONTEND_URL", "*")
 
 CORS(
     app,
@@ -50,6 +51,7 @@ jwt = JWTManager(app)
 socketio = SocketIO(
     app,
     cors_allowed_origins=FRONTEND_URL,
+    async_mode='threading'
 )
 
 
@@ -105,6 +107,9 @@ def create_order():
         )
 
         conn.commit()
+
+        # 🔔 Emit new order event via WebSocket
+        socketio.emit("new_order", {"message": "New order received"}, broadcast=True)
 
         return jsonify({"message": "Order created successfully"}), 201
 
@@ -197,7 +202,8 @@ def update_order_status(order_id):
         )
         conn.commit()
 
-        socketio.emit("order_updated", {"order_id": order_id})
+        # 🔔 Emit order update event via WebSocket
+        socketio.emit("order_updated", {"order_id": order_id}, broadcast=True)
         return jsonify({"message": "Status updated"})
     finally:
         conn.close()
@@ -224,8 +230,9 @@ def mark_paid(order_id):
         cursor.execute("UPDATE tables SET status='free' WHERE id=%s", (table_id,))
         conn.commit()
 
-        socketio.emit("order_updated", {"order_id": order_id})
-        socketio.emit("table_updated", {"table_id": table_id})
+        # 🔔 Emit events via WebSocket
+        socketio.emit("order_updated", {"order_id": order_id}, broadcast=True)
+        socketio.emit("table_updated", {"table_id": table_id}, broadcast=True)
 
         return jsonify({"message": "Order paid & table freed"})
     finally:
@@ -249,7 +256,8 @@ def update_table_status(table_id):
         )
         conn.commit()
 
-        socketio.emit("table_updated", {"table_id": table_id})
+        # 🔔 Emit table update event via WebSocket
+        socketio.emit("table_updated", {"table_id": table_id}, broadcast=True)
         return jsonify({"message": "Table status updated"})
     finally:
         conn.close()
@@ -276,8 +284,43 @@ def total_income():
 
 
 # ============================================================
+#                        ADMIN LOGIN
+# ============================================================
+
+@app.route("/admin/login", methods=["POST"])
+def admin_login():
+    data = request.get_json()
+    
+    if not data or not data.get("username") or not data.get("password"):
+        return jsonify({"message": "Username and password required"}), 400
+    
+    username = data.get("username")
+    password = data.get("password")
+    
+    # ✅ Hardcoded admin credentials (replace with database in production)
+    ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+    ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "1234")
+    
+    if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+        access_token = create_access_token(identity=username)
+        return jsonify({"access_token": access_token}), 200
+    
+    return jsonify({"message": "Invalid credentials"}), 401
+
+
+# ============================================================
+#                        HEALTH CHECK
+# ============================================================
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({"status": "API is running"}), 200
+
+
+# ============================================================
 #                        RUN LOCAL
 # ============================================================
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    port = int(os.getenv("PORT", 5000))
+    socketio.run(app, host="0.0.0.0", port=port, debug=False)
