@@ -27,14 +27,12 @@ from werkzeug.security import check_password_hash
 
 app = Flask(__name__)
 
-# -------------------- RATE LIMITER --------------------
 limiter = Limiter(
     get_remote_address,
     app=app,
     default_limits=["200 per day", "50 per hour"]
 )
 
-# -------------------- CORS CONFIG --------------------
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
 CORS(
@@ -43,11 +41,9 @@ CORS(
     supports_credentials=True,
 )
 
-# -------------------- JWT CONFIG --------------------
 app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "super-secret-key")
 jwt = JWTManager(app)
 
-# -------------------- SOCKET.IO --------------------
 socketio = SocketIO(
     app,
     cors_allowed_origins=FRONTEND_URL,
@@ -61,7 +57,9 @@ socketio = SocketIO(
 def get_tables():
     conn = get_connection()
     try:
-        tables = conn.execute("SELECT * FROM tables").fetchall()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM tables")
+        tables = cursor.fetchall()
         return jsonify(tables)
     finally:
         conn.close()
@@ -189,14 +187,14 @@ def update_order_status(order_id):
 
     conn = get_connection()
     try:
-        conn.execute(
+        cursor = conn.cursor()
+        cursor.execute(
             "UPDATE orders SET status=%s WHERE id=%s",
             (data["status"], order_id)
         )
         conn.commit()
 
         socketio.emit("order_updated", {"order_id": order_id})
-
         return jsonify({"message": "Status updated"})
     finally:
         conn.close()
@@ -219,8 +217,8 @@ def mark_paid(order_id):
 
         table_id = order["table_id"]
 
-        conn.execute("UPDATE orders SET status='paid' WHERE id=%s", (order_id,))
-        conn.execute("UPDATE tables SET status='free' WHERE id=%s", (table_id,))
+        cursor.execute("UPDATE orders SET status='paid' WHERE id=%s", (order_id,))
+        cursor.execute("UPDATE tables SET status='free' WHERE id=%s", (table_id,))
         conn.commit()
 
         socketio.emit("order_updated", {"order_id": order_id})
@@ -241,14 +239,14 @@ def update_table_status(table_id):
 
     conn = get_connection()
     try:
-        conn.execute(
+        cursor = conn.cursor()
+        cursor.execute(
             "UPDATE tables SET status=%s WHERE id=%s",
             (data["status"], table_id)
         )
         conn.commit()
 
         socketio.emit("table_updated", {"table_id": table_id})
-
         return jsonify({"message": "Table status updated"})
     finally:
         conn.close()
@@ -272,68 +270,3 @@ def total_income():
         })
     finally:
         conn.close()
-
-
-@app.route("/admin/login", methods=["POST"])
-@limiter.limit("5 per minute")
-def admin_login():
-    data = request.get_json()
-
-    if not data:
-        return jsonify({"error": "Invalid JSON"}), 400
-
-    username = data.get("username")
-    password = data.get("password")
-
-    if not username or not password:
-        return jsonify({"error": "Username and password required"}), 400
-
-    conn = get_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT * FROM admin WHERE username=%s",
-            (username,)
-        )
-        admin = cursor.fetchone()
-
-        if not admin:
-            return jsonify({"error": "Invalid credentials"}), 401
-
-        if not check_password_hash(admin["password"], password):
-            return jsonify({"error": "Invalid credentials"}), 401
-
-        access_token = create_access_token(identity=username)
-
-        return jsonify({"access_token": access_token})
-    finally:
-        conn.close()
-
-
-def delete_old_orders():
-    conn = get_connection()
-    try:
-        conn.execute("""
-            DELETE FROM orders
-            WHERE status='paid'
-            AND created_at < NOW() - INTERVAL '30 days'
-        """)
-        conn.commit()
-        print("Old orders cleaned.")
-    finally:
-        conn.close()
-
-
-scheduler = BackgroundScheduler()
-scheduler.add_job(delete_old_orders, "interval", hours=24)
-scheduler.start()
-
-@app.route("/init-db")
-def init_db_route():
-    from init_db import initialize_database
-    initialize_database()
-    return "Database initialized successfully"
-
-
-if __name__ == "__main__":
-    socketio.run(app, host="0.0.0.0", port=5000)
