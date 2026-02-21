@@ -24,7 +24,7 @@ function OrderStatus() {
 
     try {
       const res = await fetch(
-        `http://localhost:5000/orders/table/${selectedTable.id}?session_id=${sessionId}`
+        `https://five0-50-chinese-fast-food-6.onrender.com/orders/table/${selectedTable.id}?session_id=${sessionId}`
       );
 
       if (!res.ok) throw new Error("Failed to fetch orders");
