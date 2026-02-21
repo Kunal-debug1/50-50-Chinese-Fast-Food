@@ -34,7 +34,7 @@ function TableSelection() {
 
   /* ================= REAL-TIME SOCKET ================= */
   useEffect(() => {
-    const socket = io("http://localhost:5000");
+    const socket = io("https://five0-50-chinese-fast-food-6.onrender.com");
 
     socket.on("table_updated", stableFetch);
     socket.on("new_order", stableFetch);
