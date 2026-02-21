@@ -328,6 +328,11 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(delete_old_orders, "interval", hours=24)
 scheduler.start()
 
+@app.route("/init-db")
+def init_db_route():
+    from init_db import *
+    return "Database initialized"
+
 
 if __name__ == "__main__":
     socketio.run(app, host="0.0.0.0", port=5000)
