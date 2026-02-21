@@ -1,33 +1,33 @@
 import os
-from psycopg_pool import ConnectionPool
-from psycopg.rows import dict_row
+import psycopg2
+import psycopg2.extras
+from psycopg2 import pool
 
 # ============================================================
-#              CONNECTION POOL (created once at startup)
+#         CONNECTION POOL — created once at startup
+#   Keeps 2 connections alive, scales to 10 under load.
+#   Avoids opening a new TCP connection on every request.
 # ============================================================
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-
 if not DATABASE_URL:
     raise Exception("DATABASE_URL environment variable not set")
 
-# ✅ Pool keeps 2 connections open, scales up to 10 under load
-# This avoids the overhead of opening a new TCP connection on every request
-pool = ConnectionPool(
-    conninfo=DATABASE_URL,
-    min_size=2,
-    max_size=10,
-    kwargs={
-        "row_factory": dict_row
-    },
-    open=True
+connection_pool = pool.ThreadedConnectionPool(
+    minconn=2,
+    maxconn=10,
+    dsn=DATABASE_URL,
 )
 
 
 def get_connection():
-    """
-    Return a connection from the pool.
-    The connection is automatically returned to the pool
-    when conn.close() is called.
-    """
-    return pool.getconn()
+    """Get a connection from the pool. Call conn.close() to return it."""
+    conn = connection_pool.getconn()
+    # Return rows as dicts instead of tuples
+    conn.cursor_factory = psycopg2.extras.RealDictCursor
+    return conn
+
+
+def release_connection(conn):
+    """Return connection back to the pool."""
+    connection_pool.putconn(conn)
