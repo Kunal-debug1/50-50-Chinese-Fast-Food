@@ -2,6 +2,7 @@
 #                        IMPORTS
 # ============================================================
 
+import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from database import get_connection
@@ -27,7 +28,6 @@ from werkzeug.security import check_password_hash
 app = Flask(__name__)
 
 # -------------------- RATE LIMITER --------------------
-# Protects APIs from abuse (brute force, spam, etc.)
 limiter = Limiter(
     get_remote_address,
     app=app,
@@ -35,32 +35,26 @@ limiter = Limiter(
 )
 
 # -------------------- CORS CONFIG --------------------
-# Allows frontend (React app) to access backend
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+
 CORS(
     app,
-    resources={r"/*": {"origins": "http://localhost:5173"}},
+    resources={r"/*": {"origins": FRONTEND_URL}},
     supports_credentials=True,
 )
 
 # -------------------- JWT CONFIG --------------------
-# Used for admin authentication
-app.config["JWT_SECRET_KEY"] = "super-secret-key"
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "super-secret-key")
 jwt = JWTManager(app)
 
 # -------------------- SOCKET.IO --------------------
-# Used for real-time updates
 socketio = SocketIO(
     app,
-    cors_allowed_origins="http://localhost:5173"
+    cors_allowed_origins=FRONTEND_URL,
 )
-
 
 # ============================================================
 #                        ROUTES
-# ============================================================
-
-# ============================================================
-# GET ALL TABLES
 # ============================================================
 
 @app.route("/tables", methods=["GET"])
@@ -68,14 +62,10 @@ def get_tables():
     conn = get_connection()
     try:
         tables = conn.execute("SELECT * FROM tables").fetchall()
-        return jsonify([dict(row) for row in tables])
+        return jsonify(tables)
     finally:
         conn.close()
 
-
-# ============================================================
-# CREATE NEW ORDER
-# ============================================================
 
 @app.route("/orders", methods=["POST"])
 def create_order():
@@ -83,7 +73,6 @@ def create_order():
     try:
         data = request.get_json()
 
-        # Validate JSON
         if not data:
             return jsonify({"error": "Invalid JSON"}), 400
 
@@ -94,11 +83,10 @@ def create_order():
         conn = get_connection()
         cursor = conn.cursor()
 
-        # Insert order
         cursor.execute("""
             INSERT INTO orders 
             (table_id, items, total, status, customer_name, whatsapp, session_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
         """, (
             data.get("table_id"),
             json.dumps(data.get("items", [])),
@@ -109,10 +97,10 @@ def create_order():
             session_id
         ))
 
-        # Mark table as reserved
-        cursor.execute("""
-            UPDATE tables SET status='reserved' WHERE id=?
-        """, (data.get("table_id"),))
+        cursor.execute(
+            "UPDATE tables SET status='reserved' WHERE id=%s",
+            (data.get("table_id"),)
+        )
 
         conn.commit()
 
@@ -129,55 +117,41 @@ def create_order():
             conn.close()
 
 
-# ============================================================
-# GET ORDERS BY SESSION
-# ============================================================
-
 @app.route("/orders/session/<session_id>", methods=["GET"])
 def get_session_orders(session_id):
     conn = get_connection()
     try:
-        orders = conn.execute(
-            "SELECT * FROM orders WHERE session_id=? ORDER BY created_at ASC",
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM orders WHERE session_id=%s ORDER BY created_at ASC",
             (session_id,)
-        ).fetchall()
+        )
+        orders = cursor.fetchall()
 
-        result = []
-        for row in orders:
-            order = dict(row)
+        for order in orders:
             order["items"] = json.loads(order["items"]) if order.get("items") else []
-            result.append(order)
 
-        return jsonify(result)
+        return jsonify(orders)
     finally:
         conn.close()
 
-
-# ============================================================
-# GET ALL ORDERS (ADMIN ONLY)
-# ============================================================
 
 @app.route("/orders", methods=["GET"])
 @jwt_required()
 def get_orders():
     conn = get_connection()
     try:
-        rows = conn.execute("SELECT * FROM orders").fetchall()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM orders")
+        rows = cursor.fetchall()
 
-        result = []
-        for row in rows:
-            order = dict(row)
+        for order in rows:
             order["items"] = json.loads(order["items"]) if order.get("items") else []
-            result.append(order)
 
-        return jsonify(result)
+        return jsonify(rows)
     finally:
         conn.close()
 
-
-# ============================================================
-# GET ORDERS BY TABLE + SESSION
-# ============================================================
 
 @app.route("/orders/table/<int:table_id>", methods=["GET"])
 def get_orders_by_table(table_id):
@@ -188,26 +162,22 @@ def get_orders_by_table(table_id):
 
     conn = get_connection()
     try:
-        rows = conn.execute("""
+        cursor = conn.cursor()
+        cursor.execute("""
             SELECT * FROM orders
-            WHERE table_id=? AND session_id=?
+            WHERE table_id=%s AND session_id=%s
             ORDER BY id ASC
-        """, (table_id, session_id)).fetchall()
+        """, (table_id, session_id))
 
-        result = []
-        for row in rows:
-            order = dict(row)
+        rows = cursor.fetchall()
+
+        for order in rows:
             order["items"] = json.loads(order["items"]) if order.get("items") else []
-            result.append(order)
 
-        return jsonify(result)
+        return jsonify(rows)
     finally:
         conn.close()
 
-
-# ============================================================
-# UPDATE ORDER STATUS (ADMIN)
-# ============================================================
 
 @app.route("/orders/<int:order_id>", methods=["PUT"])
 @jwt_required()
@@ -220,12 +190,11 @@ def update_order_status(order_id):
     conn = get_connection()
     try:
         conn.execute(
-            "UPDATE orders SET status=? WHERE id=?",
+            "UPDATE orders SET status=%s WHERE id=%s",
             (data["status"], order_id)
         )
         conn.commit()
 
-        # Emit socket event
         socketio.emit("order_updated", {"order_id": order_id})
 
         return jsonify({"message": "Status updated"})
@@ -233,31 +202,27 @@ def update_order_status(order_id):
         conn.close()
 
 
-# ============================================================
-# MARK ORDER AS PAID
-# ============================================================
-
 @app.route("/orders/<int:order_id>/pay", methods=["PUT"])
 @jwt_required()
 def mark_paid(order_id):
     conn = get_connection()
     try:
-        order = conn.execute(
-            "SELECT table_id FROM orders WHERE id=?",
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT table_id FROM orders WHERE id=%s",
             (order_id,)
-        ).fetchone()
+        )
+        order = cursor.fetchone()
 
         if not order:
             return jsonify({"error": "Order not found"}), 404
 
         table_id = order["table_id"]
 
-        # Update order & table
-        conn.execute("UPDATE orders SET status='paid' WHERE id=?", (order_id,))
-        conn.execute("UPDATE tables SET status='free' WHERE id=?", (table_id,))
+        conn.execute("UPDATE orders SET status='paid' WHERE id=%s", (order_id,))
+        conn.execute("UPDATE tables SET status='free' WHERE id=%s", (table_id,))
         conn.commit()
 
-        # Emit socket events
         socketio.emit("order_updated", {"order_id": order_id})
         socketio.emit("table_updated", {"table_id": table_id})
 
@@ -265,10 +230,6 @@ def mark_paid(order_id):
     finally:
         conn.close()
 
-
-# ============================================================
-# UPDATE TABLE STATUS
-# ============================================================
 
 @app.route("/tables/<int:table_id>", methods=["PUT"])
 @jwt_required()
@@ -281,7 +242,7 @@ def update_table_status(table_id):
     conn = get_connection()
     try:
         conn.execute(
-            "UPDATE tables SET status=? WHERE id=?",
+            "UPDATE tables SET status=%s WHERE id=%s",
             (data["status"], table_id)
         )
         conn.commit()
@@ -293,20 +254,18 @@ def update_table_status(table_id):
         conn.close()
 
 
-# ============================================================
-# TOTAL INCOME (ADMIN)
-# ============================================================
-
 @app.route("/income", methods=["GET"])
 @jwt_required()
 def total_income():
     conn = get_connection()
     try:
-        row = conn.execute("""
+        cursor = conn.cursor()
+        cursor.execute("""
             SELECT SUM(total) as income 
             FROM orders 
             WHERE status='paid'
-        """).fetchone()
+        """)
+        row = cursor.fetchone()
 
         return jsonify({
             "total_income": row["income"] if row and row["income"] else 0
@@ -314,10 +273,6 @@ def total_income():
     finally:
         conn.close()
 
-
-# ============================================================
-# ADMIN LOGIN
-# ============================================================
 
 @app.route("/admin/login", methods=["POST"])
 @limiter.limit("5 per minute")
@@ -335,10 +290,12 @@ def admin_login():
 
     conn = get_connection()
     try:
-        admin = conn.execute(
-            "SELECT * FROM admin WHERE username=?",
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM admin WHERE username=%s",
             (username,)
-        ).fetchone()
+        )
+        admin = cursor.fetchone()
 
         if not admin:
             return jsonify({"error": "Invalid credentials"}), 401
@@ -352,10 +309,6 @@ def admin_login():
     finally:
         conn.close()
 
-
-# ============================================================
-# AUTO CLEANUP (POSTGRESQL)
-# ============================================================
 
 def delete_old_orders():
     conn = get_connection()
@@ -371,15 +324,10 @@ def delete_old_orders():
         conn.close()
 
 
-# Run cleanup every 24 hours
 scheduler = BackgroundScheduler()
 scheduler.add_job(delete_old_orders, "interval", hours=24)
 scheduler.start()
 
 
-# ============================================================
-# RUN SERVER
-# ============================================================
-
 if __name__ == "__main__":
-    socketio.run(app, host="0.0.0.0", port=5000, debug=True)
+    socketio.run(app, host="0.0.0.0", port=5000)

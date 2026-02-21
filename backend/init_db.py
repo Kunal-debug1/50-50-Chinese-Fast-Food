@@ -10,7 +10,7 @@ try:
     # -------------------- TABLES TABLE --------------------
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS tables (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         number TEXT NOT NULL,
         status TEXT DEFAULT 'free'
     )
@@ -19,10 +19,10 @@ try:
     # -------------------- ORDERS TABLE --------------------
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         table_id INTEGER,
         items TEXT,
-        total REAL,
+        total NUMERIC,
         status TEXT DEFAULT 'preparing',
         customer_name TEXT,
         whatsapp TEXT,
@@ -31,35 +31,35 @@ try:
     )
     """)
 
-    # -------------------- INSERT DEFAULT TABLES --------------------
-    cursor.execute("SELECT COUNT(*) FROM tables")
-    count = cursor.fetchone()[0]
-
-    if count == 0:
-        for i in range(1, 7):
-            cursor.execute(
-                "INSERT INTO tables (number, status) VALUES (?, ?)",
-                (f"T{i}", "free")
-            )
-
     # -------------------- ADMIN TABLE --------------------
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS admin (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id SERIAL PRIMARY KEY,
         username TEXT UNIQUE,
         password TEXT
     )
     """)
 
+    # -------------------- INSERT DEFAULT TABLES --------------------
+    cursor.execute("SELECT COUNT(*) FROM tables")
+    count = cursor.fetchone()["count"]
+
+    if count == 0:
+        for i in range(1, 7):
+            cursor.execute(
+                "INSERT INTO tables (number, status) VALUES (%s, %s)",
+                (f"T{i}", "free")
+            )
+
     # -------------------- INSERT DEFAULT ADMIN --------------------
     cursor.execute("SELECT COUNT(*) FROM admin")
-    admin_count = cursor.fetchone()[0]
+    admin_count = cursor.fetchone()["count"]
 
     if admin_count == 0:
         hashed_password = generate_password_hash("1234")
 
         cursor.execute(
-            "INSERT INTO admin (username, password) VALUES (?, ?)",
+            "INSERT INTO admin (username, password) VALUES (%s, %s)",
             ("admin", hashed_password)
         )
 
