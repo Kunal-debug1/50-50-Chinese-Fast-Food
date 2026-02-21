@@ -330,8 +330,9 @@ scheduler.start()
 
 @app.route("/init-db")
 def init_db_route():
-    import init_db
-    return "Database initialized"
+    from init_db import initialize_database
+    initialize_database()
+    return "Database initialized successfully"
 
 
 if __name__ == "__main__":
