@@ -146,31 +146,37 @@ function AdminDashboard() {
     const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
     const msg = `
-*50-50 Chinese Fast Food*
+*50-50 CHINESE FAST FOOD*
 CIDCO, Chhatrapati Sambhajinagar
 
-──────────────────
-*INVOICE*
-──────────────────
-Order ID: ${order.id}
-Table No: ${order.table_id}
-Customer: ${order.customer_name}
-Time: ${time}
+============================
+         INVOICE
+============================
 
-──────────────────
-*ITEM DETAILS*
-──────────────────
+Order ID  : ${order.id}
+Table No  : ${order.table_id}
+Customer  : ${order.customer_name}
+Time      : ${time}
+
+----------------------------
+       ITEM DETAILS
+----------------------------
 
 ${itemsList}
 
-──────────────────
-*TOTAL PAYABLE: ₹${order.total}*
-──────────────────
+----------------------------
+  TOTAL PAYABLE : Rs.${order.total}
+----------------------------
 
-Thank you for dining with us!
-We look forward to serving you again.
+  Thank you for dining with us!
+ We look forward to serving you again.
 
-For feedback call: +91-8830146272
+  Feedback & Enquiry:
+     +91-88301 46272
+
+============================
+    *50-50 CHINESE FAST FOOD*
+============================
 `.trim();
 
     window.open(`https://wa.me/${phone}?text=${encodeURIComponent(msg)}`, "_blank");
@@ -185,13 +191,6 @@ For feedback call: +91-8830146272
   return (
     <div style={S.page}>
       <style>{css}</style>
-
-      {/* ── TOP BAR ── */}
-      <div style={S.topBar}>
-          <span style={S.liveTag}>🟢 Live · refreshes every 5s</span>
-          <button style={S.logoutBtn} onClick={handleLogout}>Logout</button>
-        </div>
-      </div>
 
       {/* ── CONTENT ── */}
       <div className="wrap" style={S.wrap}>
