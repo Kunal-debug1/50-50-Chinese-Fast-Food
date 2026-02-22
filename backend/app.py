@@ -1,6 +1,6 @@
 # ============================================================
-#                        EVENTLET MONKEY PATCH
-#   Must be the very first lines before any other imports
+#                 EVENTLET MONKEY PATCH
+#       Must be first lines before ANY other import
 # ============================================================
 import eventlet
 eventlet.monkey_patch()
@@ -15,8 +15,6 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required
 from flask_socketio import SocketIO
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 from flask_caching import Cache
 
 from database import get_connection, release_connection
@@ -24,7 +22,7 @@ from init_db import initialize_database
 
 
 # ============================================================
-#                        APP & CONFIG
+#                     APP & CONFIG
 # ============================================================
 
 app = Flask(__name__)
@@ -35,23 +33,19 @@ app.config.update(
     JWT_SECRET_KEY           = os.getenv("JWT_SECRET_KEY", "super-secret-key"),
     JWT_ACCESS_TOKEN_EXPIRES = 3600,
     CACHE_TYPE               = "SimpleCache",
-    CACHE_DEFAULT_TIMEOUT    = 10,
+    CACHE_DEFAULT_TIMEOUT    = 5,       # 5s default — fresh but fast
+    JSON_SORT_KEYS           = False,   # ✅ skip sorting JSON keys = faster responses
+    PROPAGATE_EXCEPTIONS     = True,
 )
 
 # ============================================================
-#                        EXTENSIONS
+#                     EXTENSIONS
 # ============================================================
 
 CORS(app, resources={r"/*": {"origins": FRONTEND_URL}}, supports_credentials=True)
 
-jwt     = JWTManager(app)
-cache   = Cache(app)
-
-limiter = Limiter(
-    get_remote_address,
-    app=app,
-    default_limits=["200 per day", "50 per hour"],
-)
+jwt      = JWTManager(app)
+cache    = Cache(app)
 
 socketio = SocketIO(
     app,
@@ -59,28 +53,38 @@ socketio = SocketIO(
     async_mode="eventlet",
     ping_timeout=20,
     ping_interval=10,
+    logger=False,       # ✅ no logging overhead
+    engineio_logger=False,
 )
 
 # ============================================================
-#                        DATABASE INIT
+#                    DATABASE INIT
 # ============================================================
 
 initialize_database()
 
 
 # ============================================================
-#                        HELPER
+#                       HELPERS
 # ============================================================
 
 def parse_items(rows):
-    """Convert items JSON string to list for each order row."""
+    """Parse items JSON string → list for each order row."""
     for row in rows:
         row["items"] = json.loads(row["items"]) if row.get("items") else []
     return rows
 
 
+def emit(event, data):
+    """Helper to emit socket events safely."""
+    try:
+        socketio.emit(event, data, broadcast=True)
+    except Exception:
+        pass
+
+
 # ============================================================
-#                        ROUTES — TABLES
+#                   ROUTES — TABLES
 # ============================================================
 
 @app.route("/tables", methods=["GET"])
@@ -89,7 +93,8 @@ def get_tables():
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM tables")
+        # ✅ Only fetch columns we need
+        cursor.execute("SELECT id, number, status FROM tables ORDER BY id ASC")
         return jsonify(cursor.fetchall())
     finally:
         release_connection(conn)
@@ -105,17 +110,20 @@ def update_table_status(table_id):
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute("UPDATE tables SET status=%s WHERE id=%s", (data["status"], table_id))
+        cursor.execute(
+            "UPDATE tables SET status=%s WHERE id=%s",
+            (data["status"], table_id)
+        )
         conn.commit()
         cache.delete("all_tables")
-        socketio.emit("table_updated", {"table_id": table_id}, broadcast=True)
+        emit("table_updated", {"table_id": table_id})
         return jsonify({"message": "Table status updated"})
     finally:
         release_connection(conn)
 
 
 # ============================================================
-#                        ROUTES — ORDERS
+#                   ROUTES — ORDERS
 # ============================================================
 
 @app.route("/orders", methods=["POST"])
@@ -130,15 +138,19 @@ def create_order():
         if not session_id:
             return jsonify({"error": "Session ID missing"}), 400
 
+        table_id = data.get("table_id")
+
         conn = get_connection()
         cursor = conn.cursor()
 
+        # ✅ Both inserts in one transaction — single commit
         cursor.execute("""
             INSERT INTO orders
                 (table_id, items, total, status, customer_name, whatsapp, session_id)
             VALUES (%s, %s, %s, 'pending', %s, %s, %s)
+            RETURNING id
         """, (
-            data.get("table_id"),
+            table_id,
             json.dumps(data.get("items", [])),
             data.get("total", 0),
             data.get("customer_name"),
@@ -146,16 +158,18 @@ def create_order():
             session_id,
         ))
 
+        order_id = cursor.fetchone()["id"]
+
         cursor.execute(
             "UPDATE tables SET status='reserved' WHERE id=%s",
-            (data.get("table_id"),)
+            (table_id,)
         )
         conn.commit()
 
-        cache.delete_many("all_tables", "total_income")
-        socketio.emit("new_order", {"message": "New order received"}, broadcast=True)
+        cache.delete_many("all_tables", "all_orders", "total_income")
+        emit("new_order", {"message": "New order received", "order_id": order_id})
 
-        return jsonify({"message": "Order created successfully"}), 201
+        return jsonify({"message": "Order created successfully", "order_id": order_id}), 201
 
     except Exception as e:
         if conn:
@@ -173,7 +187,13 @@ def get_orders():
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM orders ORDER BY created_at DESC")
+        # ✅ Uses idx_orders_created_at index
+        cursor.execute("""
+            SELECT id, table_id, items, total, status,
+                   customer_name, whatsapp, session_id, created_at
+            FROM orders
+            ORDER BY created_at DESC
+        """)
         return jsonify(parse_items(cursor.fetchall()))
     finally:
         release_connection(conn)
@@ -184,11 +204,12 @@ def get_session_orders(session_id):
     conn = get_connection()
     try:
         cursor = conn.cursor()
+        # ✅ Uses idx_orders_session_id index
         cursor.execute("""
             SELECT id, table_id, items, total, status,
                    customer_name, whatsapp, session_id, created_at
             FROM orders
-            WHERE session_id=%s
+            WHERE session_id = %s
             ORDER BY created_at ASC
         """, (session_id,))
         return jsonify(parse_items(cursor.fetchall()))
@@ -205,11 +226,12 @@ def get_orders_by_table(table_id):
     conn = get_connection()
     try:
         cursor = conn.cursor()
+        # ✅ Uses idx_orders_table_session composite index
         cursor.execute("""
             SELECT id, table_id, items, total, status,
                    customer_name, whatsapp, session_id, created_at
             FROM orders
-            WHERE table_id=%s AND session_id=%s
+            WHERE table_id = %s AND session_id = %s
             ORDER BY id ASC
         """, (table_id, session_id))
         return jsonify(parse_items(cursor.fetchall()))
@@ -233,7 +255,7 @@ def update_order_status(order_id):
         )
         conn.commit()
         cache.delete("all_orders")
-        socketio.emit("order_updated", {"order_id": order_id}, broadcast=True)
+        emit("order_updated", {"order_id": order_id})
         return jsonify({"message": "Status updated"})
     finally:
         release_connection(conn)
@@ -245,6 +267,7 @@ def mark_paid(order_id):
     conn = get_connection()
     try:
         cursor = conn.cursor()
+        # ✅ RETURNING avoids a second SELECT query
         cursor.execute(
             "UPDATE orders SET status='paid' WHERE id=%s RETURNING table_id",
             (order_id,)
@@ -258,8 +281,8 @@ def mark_paid(order_id):
         conn.commit()
 
         cache.delete_many("all_tables", "all_orders", "total_income")
-        socketio.emit("order_updated", {"order_id": order_id}, broadcast=True)
-        socketio.emit("table_updated", {"table_id": table_id}, broadcast=True)
+        emit("order_updated", {"order_id": order_id})
+        emit("table_updated", {"table_id": table_id})
 
         return jsonify({"message": "Order paid & table freed"})
     finally:
@@ -267,7 +290,7 @@ def mark_paid(order_id):
 
 
 # ============================================================
-#                        ROUTES — INCOME
+#                   ROUTES — INCOME
 # ============================================================
 
 @app.route("/income", methods=["GET"])
@@ -277,19 +300,21 @@ def total_income():
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT SUM(total) AS income FROM orders WHERE status='paid'")
+        # ✅ Uses idx_orders_status index
+        cursor.execute(
+            "SELECT COALESCE(SUM(total), 0) AS income FROM orders WHERE status='paid'"
+        )
         row = cursor.fetchone()
-        return jsonify({"total_income": float(row["income"]) if row and row["income"] else 0})
+        return jsonify({"total_income": float(row["income"])})
     finally:
         release_connection(conn)
 
 
 # ============================================================
-#                        ROUTES — ADMIN
+#                   ROUTES — ADMIN LOGIN
 # ============================================================
 
 @app.route("/admin/login", methods=["POST"])
-@limiter.limit("10 per minute")
 def admin_login():
     data = request.get_json()
     if not data or not data.get("username") or not data.get("password"):
@@ -299,13 +324,14 @@ def admin_login():
     ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "8830146272")
 
     if data["username"] == ADMIN_USERNAME and data["password"] == ADMIN_PASSWORD:
-        return jsonify({"access_token": create_access_token(identity=data["username"])}), 200
+        token = create_access_token(identity=data["username"])
+        return jsonify({"access_token": token}), 200
 
     return jsonify({"message": "Invalid credentials"}), 401
 
 
 # ============================================================
-#                        HEALTH CHECK
+#                   HEALTH CHECK
 # ============================================================
 
 @app.route("/health", methods=["GET"])
@@ -314,7 +340,7 @@ def health_check():
 
 
 # ============================================================
-#                        RUN LOCAL
+#                   RUN LOCAL
 # ============================================================
 
 if __name__ == "__main__":
