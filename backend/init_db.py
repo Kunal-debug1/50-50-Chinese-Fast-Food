@@ -7,7 +7,7 @@ def initialize_database():
         cursor = conn.cursor()
 
         # ============================================================
-        #                        CREATE TABLES
+        #                     CREATE TABLES
         # ============================================================
 
         cursor.execute("""
@@ -41,24 +41,35 @@ def initialize_database():
         """)
 
         # ============================================================
-        #              INDEXES — speeds up frequent lookups
+        #       INDEXES — critical for fast queries on large tables
         # ============================================================
 
+        # Fast lookup by session_id (used on every customer page load)
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_orders_session_id
             ON orders (session_id)
         """)
+
+        # Fast lookup for table + session combo
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_orders_table_session
             ON orders (table_id, session_id)
         """)
+
+        # Fast filter for paid/pending (used in admin + income)
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_orders_status
             ON orders (status)
         """)
 
+        # Fast sort for admin dashboard (most recent first)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_orders_created_at
+            ON orders (created_at DESC)
+        """)
+
         # ============================================================
-        #                        SEED DATA
+        #                      SEED DATA
         # ============================================================
 
         cursor.execute("SELECT COUNT(*) FROM tables")
@@ -77,6 +88,11 @@ def initialize_database():
             )
 
         conn.commit()
+        print("✅ Database initialized successfully")
 
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ Database init error: {e}")
+        raise
     finally:
         release_connection(conn)
