@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useHotel } from "../context/HotelContext";
 
+const API = "https://five0-50-chinese-fast-food-6.onrender.com";
+
 function OrderStatus() {
   const { selectedTable, endSession } = useHotel();
   const navigate = useNavigate();
@@ -24,7 +26,7 @@ function OrderStatus() {
 
     try {
       const res = await fetch(
-        `https://five0-50-chinese-fast-food-6.onrender.com/orders/table/${selectedTable.id}?session_id=${sessionId}`
+        `${API}/orders/table/${selectedTable.id}?session_id=${sessionId}`
       );
 
       if (!res.ok) throw new Error("Failed to fetch orders");
