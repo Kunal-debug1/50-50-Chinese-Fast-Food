@@ -188,8 +188,6 @@ For feedback call: +91-8830146272
 
       {/* ── TOP BAR ── */}
       <div style={S.topBar}>
-        <span style={S.topTitle}>🍜 50-50 Admin</span>
-        <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
           <span style={S.liveTag}>🟢 Live · refreshes every 5s</span>
           <button style={S.logoutBtn} onClick={handleLogout}>Logout</button>
         </div>
