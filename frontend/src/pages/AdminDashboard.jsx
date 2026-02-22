@@ -1,195 +1,139 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
-import { io } from "socket.io-client";
 
 const API = "https://five0-50-chinese-fast-food-6.onrender.com";
+const POLL_INTERVAL = 5000; // 5 seconds
 
 function AdminDashboard() {
-  const navigate = useNavigate();
+  const navigate   = useNavigate();
+  const token      = localStorage.getItem("adminToken");
 
-  // ─── Auth ────────────────────────────────────────────────
-  const [token, setToken] = useState(() => localStorage.getItem("adminToken"));
-
-  // Redirect immediately if no token
+  // ─── Redirect if no token ────────────────────────────────
   useEffect(() => {
-    if (!token) {
-      navigate("/admin-login", { replace: true });
-    }
-  }, [token, navigate]);
+    if (!token) navigate("/admin-login", { replace: true });
+  }, []);
 
   // ─── State ───────────────────────────────────────────────
-  const [tables, setTables]   = useState([]);
-  const [orders, setOrders]   = useState([]);
-  const [income, setIncome]   = useState(0);
+  const [tables,  setTables]  = useState([]);
+  const [orders,  setOrders]  = useState([]);
+  const [income,  setIncome]  = useState(0);
   const [loading, setLoading] = useState(true);
-  const [error, setError]     = useState(null);
 
-  const audioRef  = useRef(null);
-  const socketRef = useRef(null);
+  const audioRef        = useRef(null);
+  const prevOrderCount  = useRef(null); // track new orders for notification
+  const pollingRef      = useRef(null);
+
+  // ─── Auth headers ────────────────────────────────────────
+  const authGet = useCallback((url) =>
+    fetch(url, { headers: { Authorization: "Bearer " + token } }),
+  [token]);
 
   // ─── Logout ──────────────────────────────────────────────
-  const handleLogout = useCallback(() => {
+  const handleLogout = () => {
     localStorage.removeItem("adminToken");
-    setToken(null);
-    if (socketRef.current) socketRef.current.disconnect();
+    clearInterval(pollingRef.current);
     navigate("/admin-login", { replace: true });
-  }, [navigate]);
+  };
 
-  // ─── Fetch Helpers ───────────────────────────────────────
-  const authHeaders = useCallback(() => ({
-    "Content-Type": "application/json",
-    Authorization: "Bearer " + token,
-  }), [token]);
-
-  const fetchTables = useCallback(async () => {
+  // ─── Fetch All Data ──────────────────────────────────────
+  const fetchAll = useCallback(async (isBackground = false) => {
     try {
-      const res = await fetch(`${API}/tables`);
-      if (!res.ok) throw new Error("Failed to fetch tables");
-      setTables(await res.json());
+      const [tRes, oRes, iRes] = await Promise.all([
+        fetch(`${API}/tables`),
+        authGet(`${API}/orders`),
+        authGet(`${API}/income`),
+      ]);
+
+      // Session expired
+      if (oRes.status === 401 || iRes.status === 401) {
+        handleLogout();
+        return;
+      }
+
+      const [tData, oData, iData] = await Promise.all([
+        tRes.json(),
+        oRes.json(),
+        iRes.json(),
+      ]);
+
+      // ── Detect new orders & trigger notification ──
+      if (isBackground && prevOrderCount.current !== null) {
+        const newCount = oData.filter((o) => o.status !== "paid").length;
+        const oldCount = prevOrderCount.current;
+
+        if (newCount > oldCount) {
+          // 🔊 Play sound
+          if (audioRef.current) {
+            audioRef.current.currentTime = 0;
+            audioRef.current.play().catch(() => {});
+          }
+          // 🔔 Notification
+          if (Notification.permission === "granted") {
+            new Notification("🚨 New Order Received!", {
+              body: `${newCount - oldCount} new order(s) just came in!`,
+              icon: "/favicon.ico",
+            });
+          }
+        }
+        prevOrderCount.current = newCount;
+      } else {
+        // First load — set baseline
+        prevOrderCount.current = oData.filter((o) => o.status !== "paid").length;
+      }
+
+      setTables(tData);
+      setOrders(oData);
+      setIncome(iData.total_income ?? 0);
     } catch (e) {
-      console.error("fetchTables:", e);
+      console.error("fetchAll error:", e);
+    } finally {
+      if (!isBackground) setLoading(false);
     }
-  }, []);
+  }, [token]);
 
-  const fetchOrders = useCallback(async () => {
-    try {
-      const res = await fetch(`${API}/orders`, { headers: authHeaders() });
-      if (res.status === 401) { handleLogout(); return; }
-      if (!res.ok) throw new Error("Failed to fetch orders");
-      setOrders(await res.json());
-    } catch (e) {
-      console.error("fetchOrders:", e);
-    }
-  }, [authHeaders, handleLogout]);
-
-  const fetchIncome = useCallback(async () => {
-    try {
-      const res = await fetch(`${API}/income`, { headers: authHeaders() });
-      if (res.status === 401) { handleLogout(); return; }
-      if (!res.ok) throw new Error("Failed to fetch income");
-      const data = await res.json();
-      setIncome(data.total_income);
-    } catch (e) {
-      console.error("fetchIncome:", e);
-    }
-  }, [authHeaders, handleLogout]);
-
-  const fetchAll = useCallback(async () => {
-    await Promise.all([fetchTables(), fetchOrders(), fetchIncome()]);
-  }, [fetchTables, fetchOrders, fetchIncome]);
-
-  // ─── Sound + Notification ────────────────────────────────
-  const playSound = useCallback(() => {
-    if (audioRef.current) {
-      audioRef.current.currentTime = 0;
-      audioRef.current.play().catch(() => {});
-    }
-  }, []);
-
-  const showNotification = useCallback(() => {
-    if (Notification.permission === "granted") {
-      new Notification("🚨 New Order Received!", {
-        body: "A new order just came in!",
-        icon: "/favicon.ico",
-      });
-    }
-  }, []);
-
-  // ─── Initial Load ────────────────────────────────────────
+  // ─── Initial Load + Start Polling ───────────────────────
   useEffect(() => {
     if (!token) return;
 
-    // Request notification permission
+    // Ask notification permission
     if (Notification.permission === "default") {
       Notification.requestPermission();
     }
 
-    const load = async () => {
-      setLoading(true);
-      setError(null);
-      try {
-        await fetchAll();
-      } catch {
-        setError("Failed to load data. Please refresh.");
-      } finally {
-        setLoading(false);
-      }
-    };
+    // First load
+    fetchAll(false);
 
-    load();
-  }, [token]); // only on mount / token change
+    // Poll every 5 seconds
+    pollingRef.current = setInterval(() => {
+      fetchAll(true); // background = true → triggers notification logic
+    }, POLL_INTERVAL);
 
-  // ─── WebSocket ───────────────────────────────────────────
-  useEffect(() => {
-    if (!token) return;
-
-    const socket = io(API, {
-      transports: ["websocket", "polling"],
-      reconnection: true,
-      reconnectionAttempts: Infinity,
-      reconnectionDelay: 1000,
-    });
-
-    socketRef.current = socket;
-
-    socket.on("connect", () => {
-      console.log("✅ Socket connected:", socket.id);
-    });
-
-    socket.on("disconnect", (reason) => {
-      console.warn("⚠️ Socket disconnected:", reason);
-    });
-
-    socket.on("new_order", () => {
-      fetchAll();
-      playSound();
-      showNotification();
-    });
-
-    socket.on("order_updated", () => {
-      fetchAll();
-    });
-
-    socket.on("table_updated", () => {
-      fetchTables();
-    });
-
-    return () => {
-      socket.disconnect();
-      socketRef.current = null;
-    };
-  }, [token]); // reconnect only if token changes
+    return () => clearInterval(pollingRef.current);
+  }, []); // run once on mount
 
   // ─── Order Actions ───────────────────────────────────────
   const updateOrderStatus = async (orderId, status) => {
-    try {
-      const res = await fetch(`${API}/orders/${orderId}`, {
-        method: "PUT",
-        headers: authHeaders(),
-        body: JSON.stringify({ status }),
-      });
-      if (res.status === 401) { handleLogout(); return; }
-      await fetchOrders();
-    } catch (e) {
-      console.error("updateOrderStatus:", e);
-    }
+    await fetch(`${API}/orders/${orderId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+      body: JSON.stringify({ status }),
+    });
+    fetchAll(false);
   };
 
   const markAsPaid = async (orderId) => {
-    try {
-      const res = await fetch(`${API}/orders/${orderId}/pay`, {
-        method: "PUT",
-        headers: authHeaders(),
-      });
-      if (res.status === 401) { handleLogout(); return; }
-      await fetchAll();
-    } catch (e) {
-      console.error("markAsPaid:", e);
-    }
+    await fetch(`${API}/orders/${orderId}/pay`, {
+      method: "PUT",
+      headers: { Authorization: "Bearer " + token },
+    });
+    fetchAll(false);
   };
 
   const sendWhatsAppBill = (order) => {
-    playSound();
+    if (audioRef.current) {
+      audioRef.current.currentTime = 0;
+      audioRef.current.play().catch(() => {});
+    }
 
     let phone = order.whatsapp.replace(/\D/g, "");
     if (phone.length === 10) phone = "91" + phone;
@@ -234,100 +178,74 @@ For feedback call: +91-8830146272
     window.open(`https://wa.me/${phone}?text=${encodeURIComponent(message)}`, "_blank");
   };
 
-  // ─── Derived State ───────────────────────────────────────
+  // ─── Derived ─────────────────────────────────────────────
   const pendingOrders = orders.filter((o) => o.status !== "paid");
   const paidOrders    = orders.filter((o) => o.status === "paid");
 
-  // ─── Guard: not logged in ────────────────────────────────
   if (!token) return null;
 
   // ─── Render ──────────────────────────────────────────────
   return (
-    <div style={styles.container}>
+    <div style={S.container}>
       <style>{mediaQueries}</style>
       <audio ref={audioRef} src="/notification.mp3" preload="auto" />
 
-      {/* ── NAVBAR ── */}
-      <nav style={styles.navbar}>
-        <div className="nav-content" style={styles.navContent}>
-          <h1 className="admin-logo" style={styles.logo}>
-            🍜 50-50 Admin
-          </h1>
-          <button
-            className="logout-btn"
-            style={styles.logoutBtn}
-            onClick={handleLogout}
-            onMouseEnter={(e) => (e.target.style.opacity = "0.85")}
-            onMouseLeave={(e) => (e.target.style.opacity = "1")}
-          >
-            Logout
-          </button>
+      {/* NAVBAR */}
+      <nav style={S.navbar}>
+        <div className="nav-content" style={S.navContent}>
+          <h1 style={S.logo}>🍜 50-50 Admin</h1>
+          <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+            <span style={S.liveTag}>🟢 Live</span>
+            <button style={S.logoutBtn} onClick={handleLogout}>Logout</button>
+          </div>
         </div>
       </nav>
 
-      {/* ── MAIN ── */}
-      <div className="main-content" style={styles.mainContent}>
-
-        {/* Error Banner */}
-        {error && (
-          <div style={styles.errorBanner}>
-            ⚠️ {error}
-            <button style={styles.retryBtn} onClick={fetchAll}>Retry</button>
-          </div>
-        )}
-
-        {/* Loading */}
+      {/* MAIN */}
+      <div className="main-content" style={S.mainContent}>
         {loading ? (
-          <div style={styles.loadingState}>Loading dashboard...</div>
+          <div style={S.loadingState}>Loading dashboard...</div>
         ) : (
           <>
-            {/* ── KPI CARDS ── */}
-            <div className="kpi-grid" style={styles.kpiGrid}>
-              <div className="kpi-card" style={styles.kpiCard}>
-                <div className="kpi-label" style={styles.kpiLabel}>Total Income</div>
-                <div className="kpi-value" style={styles.kpiValue}>₹ {income}</div>
+            {/* KPI CARDS */}
+            <div className="kpi-grid" style={S.kpiGrid}>
+              <div className="kpi-card" style={S.kpiCard}>
+                <div style={S.kpiLabel}>Total Income</div>
+                <div style={S.kpiValue}>₹ {income}</div>
               </div>
-              <div className="kpi-card" style={styles.kpiCard}>
-                <div className="kpi-label" style={styles.kpiLabel}>Total Orders</div>
-                <div className="kpi-value" style={styles.kpiValue}>{orders.length}</div>
+              <div className="kpi-card" style={S.kpiCard}>
+                <div style={S.kpiLabel}>Total Orders</div>
+                <div style={S.kpiValue}>{orders.length}</div>
               </div>
-              <div className="kpi-card" style={styles.kpiCard}>
-                <div className="kpi-label" style={styles.kpiLabel}>Pending</div>
-                <div className="kpi-value" style={{ ...styles.kpiValue, color: "#D32F2F" }}>
-                  {pendingOrders.length}
-                </div>
+              <div className="kpi-card" style={S.kpiCard}>
+                <div style={S.kpiLabel}>Pending</div>
+                <div style={{ ...S.kpiValue, color: "#D32F2F" }}>{pendingOrders.length}</div>
               </div>
-              <div className="kpi-card" style={styles.kpiCard}>
-                <div className="kpi-label" style={styles.kpiLabel}>Completed</div>
-                <div className="kpi-value" style={{ ...styles.kpiValue, color: "#388E3C" }}>
-                  {paidOrders.length}
-                </div>
+              <div className="kpi-card" style={S.kpiCard}>
+                <div style={S.kpiLabel}>Completed</div>
+                <div style={{ ...S.kpiValue, color: "#388E3C" }}>{paidOrders.length}</div>
               </div>
             </div>
 
-            {/* ── TABLES ── */}
-            <div className="section" style={styles.section}>
-              <div className="section-header" style={styles.sectionHeader}>
-                <h2 className="section-title" style={styles.sectionTitle}>Table Management</h2>
-                <span className="badge" style={styles.badge}>{tables.length} Tables</span>
+            {/* TABLES */}
+            <div className="section" style={S.section}>
+              <div style={S.sectionHeader}>
+                <h2 style={S.sectionTitle}>Table Management</h2>
+                <span style={S.badge}>{tables.length} Tables</span>
               </div>
-              <div className="tables-container" style={styles.tablesContainer}>
+              <div className="tables-container" style={S.tablesContainer}>
                 {tables.map((t) => (
                   <div
                     key={t.id}
-                    className="table-item"
                     style={{
-                      ...styles.tableItem,
+                      ...S.tableItem,
                       background: t.status === "free" ? "#F5F5F5" : "#FFF3E0",
                       borderLeft: `4px solid ${t.status === "free" ? "#388E3C" : "#F57C00"}`,
                     }}
                   >
-                    <div className="table-info" style={styles.tableInfo}>
-                      <div className="table-num" style={styles.tableNum}>Table {t.number}</div>
-                      <div
-                        className="table-status"
-                        style={{ ...styles.tableStatus, color: t.status === "free" ? "#388E3C" : "#F57C00" }}
-                      >
+                    <div style={{ textAlign: "center" }}>
+                      <div style={S.tableNum}>Table {t.number}</div>
+                      <div style={{ ...S.tableStatus, color: t.status === "free" ? "#388E3C" : "#F57C00" }}>
                         {t.status === "free" ? "Available" : "Occupied"}
                       </div>
                     </div>
@@ -336,87 +254,57 @@ For feedback call: +91-8830146272
               </div>
             </div>
 
-            {/* ── PENDING ORDERS ── */}
-            <div className="section" style={styles.section}>
-              <div className="section-header" style={styles.sectionHeader}>
-                <h2 className="section-title" style={styles.sectionTitle}>Pending Orders</h2>
-                <span className="badge" style={{ ...styles.badge, background: "#D32F2F", color: "#FFF" }}>
+            {/* PENDING ORDERS */}
+            <div className="section" style={S.section}>
+              <div style={S.sectionHeader}>
+                <h2 style={S.sectionTitle}>Pending Orders</h2>
+                <span style={{ ...S.badge, background: "#D32F2F", color: "#FFF" }}>
                   {pendingOrders.length}
                 </span>
               </div>
 
               {pendingOrders.length === 0 ? (
-                <div className="empty-state" style={styles.emptyState}>
-                  <p>No pending orders 🎉</p>
-                </div>
+                <div style={S.emptyState}>No pending orders 🎉</div>
               ) : (
-                <div className="orders-list" style={styles.ordersList}>
+                <div style={S.ordersList}>
                   {pendingOrders.map((order) => (
-                    <div key={order.id} className="order-item" style={styles.orderItem}>
-                      <div className="order-item-left" style={styles.orderItemLeft}>
-                        <div className="order-header" style={styles.orderHeader}>
-                          <span className="order-id" style={styles.orderId}>Order #{order.id}</span>
-                          <span className="table-tag" style={styles.tableTag}>Table {order.table_id}</span>
-                          <span
-                            style={{
-                              ...styles.tableTag,
-                              background: order.status === "ready" ? "#E8F5E9" : "#FFF3E0",
-                              color: order.status === "ready" ? "#388E3C" : "#F57C00",
-                            }}
-                          >
+                    <div key={order.id} className="order-item" style={S.orderItem}>
+                      {/* LEFT */}
+                      <div className="order-left" style={S.orderLeft}>
+                        <div style={S.orderHeader}>
+                          <span style={S.orderId}>Order #{order.id}</span>
+                          <span style={S.tag}>Table {order.table_id}</span>
+                          <span style={{
+                            ...S.tag,
+                            background: order.status === "ready" ? "#E8F5E9" : "#FFF3E0",
+                            color: order.status === "ready" ? "#388E3C" : "#F57C00",
+                          }}>
                             {order.status.toUpperCase()}
                           </span>
                         </div>
-
-                        <div className="order-meta" style={styles.orderMeta}>
-                          <p className="customer-name" style={styles.customerName}>{order.customer_name}</p>
-                          <p className="customer-phone" style={styles.customerPhone}>{order.whatsapp}</p>
+                        <div style={S.orderMeta}>
+                          <span style={S.customerName}>{order.customer_name}</span>
+                          <span style={S.customerPhone}>{order.whatsapp}</span>
                         </div>
-
-                        <div className="items-detail" style={styles.itemsDetail}>
-                          <div className="items-label" style={styles.itemsLabel}>Items:</div>
-                          {order.items && order.items.length > 0 ? (
-                            <div className="items-grid" style={styles.itemsGrid}>
-                              {order.items.map((item, idx) => (
-                                <div key={idx} className="item-row" style={styles.itemRow}>
-                                  <span className="item-qty" style={styles.itemQty}>{item.quantity}x</span>
-                                  <span className="item-name-detail" style={styles.itemNameDetail}>{item.name}</span>
-                                  <span className="item-price-detail" style={styles.itemPriceDetail}>
-                                    ₹{item.price * item.quantity}
-                                  </span>
-                                </div>
-                              ))}
+                        <div style={S.itemsDetail}>
+                          <div style={S.itemsLabel}>ITEMS</div>
+                          {order.items?.map((item, idx) => (
+                            <div key={idx} style={S.itemRow}>
+                              <span style={S.itemQty}>{item.quantity}x</span>
+                              <span style={S.itemName}>{item.name}</span>
+                              <span style={S.itemPrice}>₹{item.price * item.quantity}</span>
                             </div>
-                          ) : (
-                            <p style={{ margin: "4px 0", fontSize: "12px", color: "#9C9C9C" }}>No items</p>
-                          )}
+                          ))}
                         </div>
                       </div>
 
-                      <div className="order-item-right" style={styles.orderItemRight}>
-                        <div className="amount" style={styles.amount}>₹ {order.total}</div>
-                        <div className="action-buttons" style={styles.actionButtons}>
-                          <button
-                            className="btn-primary"
-                            style={styles.btnPrimary}
-                            onClick={() => updateOrderStatus(order.id, "ready")}
-                          >
-                            Ready
-                          </button>
-                          <button
-                            className="btn-whatsapp"
-                            style={styles.btnWhatsapp}
-                            onClick={() => sendWhatsAppBill(order)}
-                          >
-                            Send
-                          </button>
-                          <button
-                            className="btn-secondary"
-                            style={styles.btnSecondary}
-                            onClick={() => markAsPaid(order.id)}
-                          >
-                            Paid
-                          </button>
+                      {/* RIGHT */}
+                      <div className="order-right" style={S.orderRight}>
+                        <div style={S.amount}>₹ {order.total}</div>
+                        <div className="action-buttons" style={S.actionButtons}>
+                          <button style={S.btnGreen}  onClick={() => updateOrderStatus(order.id, "ready")}>Ready</button>
+                          <button style={S.btnWA}     onClick={() => sendWhatsAppBill(order)}>Send</button>
+                          <button style={S.btnOrange} onClick={() => markAsPaid(order.id)}>Paid</button>
                         </div>
                       </div>
                     </div>
@@ -425,38 +313,34 @@ For feedback call: +91-8830146272
               )}
             </div>
 
-            {/* ── COMPLETED ORDERS ── */}
-            <div className="section" style={styles.section}>
-              <div className="section-header" style={styles.sectionHeader}>
-                <h2 className="section-title" style={styles.sectionTitle}>Completed Orders</h2>
-                <span className="badge" style={{ ...styles.badge, background: "#388E3C", color: "#FFF" }}>
+            {/* COMPLETED ORDERS */}
+            <div className="section" style={S.section}>
+              <div style={S.sectionHeader}>
+                <h2 style={S.sectionTitle}>Completed Orders</h2>
+                <span style={{ ...S.badge, background: "#388E3C", color: "#FFF" }}>
                   {paidOrders.length}
                 </span>
               </div>
 
               {paidOrders.length === 0 ? (
-                <div className="empty-state" style={styles.emptyState}>
-                  <p>No completed orders</p>
-                </div>
+                <div style={S.emptyState}>No completed orders</div>
               ) : (
-                <div className="orders-list" style={styles.ordersList}>
+                <div style={S.ordersList}>
                   {paidOrders.map((order) => (
-                    <div key={order.id} className="order-item completed" style={{ ...styles.orderItem, opacity: 0.7 }}>
-                      <div className="order-item-left" style={styles.orderItemLeft}>
-                        <div className="order-header" style={styles.orderHeader}>
-                          <span className="order-id" style={styles.orderId}>Order #{order.id}</span>
-                          <span className="table-tag" style={styles.tableTag}>Table {order.table_id}</span>
+                    <div key={order.id} className="order-item" style={{ ...S.orderItem, opacity: 0.7 }}>
+                      <div className="order-left" style={S.orderLeft}>
+                        <div style={S.orderHeader}>
+                          <span style={S.orderId}>Order #{order.id}</span>
+                          <span style={S.tag}>Table {order.table_id}</span>
                         </div>
-                        <div className="order-meta" style={styles.orderMeta}>
-                          <p className="customer-name" style={styles.customerName}>{order.customer_name}</p>
-                          <p className="customer-phone" style={styles.customerPhone}>{order.whatsapp}</p>
+                        <div style={S.orderMeta}>
+                          <span style={S.customerName}>{order.customer_name}</span>
+                          <span style={S.customerPhone}>{order.whatsapp}</span>
                         </div>
                       </div>
-                      <div style={{ display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap" }}>
-                        <div className="amount" style={styles.amount}>₹ {order.total}</div>
-                        <button className="btn-whatsapp" style={styles.btnWhatsapp} onClick={() => sendWhatsAppBill(order)}>
-                          Send Bill
-                        </button>
+                      <div className="order-right" style={S.orderRight}>
+                        <div style={S.amount}>₹ {order.total}</div>
+                        <button style={S.btnWA} onClick={() => sendWhatsAppBill(order)}>Send Bill</button>
                       </div>
                     </div>
                   ))}
@@ -471,298 +355,119 @@ For feedback call: +91-8830146272
 }
 
 /* ── STYLES ── */
-
-const styles = {
+const S = {
   container: {
-    background: "#F8F8F8",
-    minHeight: "100vh",
-    fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif",
-    width: "100%",
-    boxSizing: "border-box",
-    overflowX: "hidden",
+    background: "#F8F8F8", minHeight: "100vh",
+    fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif",
+    width: "100%", boxSizing: "border-box", overflowX: "hidden",
   },
   navbar: {
-    background: "#FFFFFF",
-    borderBottom: "1px solid #E8E8E8",
-    position: "sticky",
-    top: 0,
-    zIndex: 100,
+    background: "#FFFFFF", borderBottom: "1px solid #E8E8E8",
+    position: "sticky", top: 0, zIndex: 100,
     boxShadow: "0 1px 4px rgba(0,0,0,0.05)",
-    width: "100%",
   },
   navContent: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    maxWidth: "1400px",
-    margin: "0 auto",
-    padding: "16px",
-    width: "100%",
+    display: "flex", justifyContent: "space-between", alignItems: "center",
+    maxWidth: "1400px", margin: "0 auto", padding: "14px 16px",
     boxSizing: "border-box",
-    gap: "12px",
   },
-  logo: {
-    margin: 0,
-    fontSize: "20px",
-    fontWeight: "600",
-    color: "#1C1C1C",
-    letterSpacing: "-0.5px",
-    flex: "1 1 auto",
+  logo: { margin: 0, fontSize: "20px", fontWeight: "600", color: "#1C1C1C" },
+  liveTag: {
+    fontSize: "12px", fontWeight: "500", color: "#388E3C",
+    background: "#E8F5E9", padding: "4px 10px", borderRadius: "20px",
   },
   logoutBtn: {
-    background: "#EF4F5F",
-    color: "#FFFFFF",
-    border: "none",
-    padding: "8px 18px",
-    borderRadius: "4px",
-    cursor: "pointer",
-    fontSize: "13px",
-    fontWeight: "500",
-    minHeight: "40px",
-    whiteSpace: "nowrap",
+    background: "#EF4F5F", color: "#FFF", border: "none",
+    padding: "8px 18px", borderRadius: "4px", cursor: "pointer",
+    fontSize: "13px", fontWeight: "500", minHeight: "38px",
   },
   mainContent: {
-    maxWidth: "1400px",
-    margin: "0 auto",
-    padding: "20px 16px",
-    width: "100%",
+    maxWidth: "1400px", margin: "0 auto", padding: "20px 16px",
     boxSizing: "border-box",
   },
-  errorBanner: {
-    background: "#FFEBEE",
-    border: "1px solid #FFCDD2",
-    color: "#C62828",
-    padding: "12px 16px",
-    borderRadius: "4px",
-    marginBottom: "16px",
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    fontSize: "14px",
-  },
-  retryBtn: {
-    background: "#C62828",
-    color: "#FFF",
-    border: "none",
-    padding: "4px 12px",
-    borderRadius: "4px",
-    cursor: "pointer",
-    fontSize: "12px",
-  },
-  loadingState: {
-    textAlign: "center",
-    padding: "60px 20px",
-    color: "#9C9C9C",
-    fontSize: "16px",
-  },
+  loadingState: { textAlign: "center", padding: "80px 20px", color: "#9C9C9C", fontSize: "16px" },
   kpiGrid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
-    gap: "16px",
-    marginBottom: "30px",
-    width: "100%",
+    display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+    gap: "16px", marginBottom: "24px",
   },
   kpiCard: {
-    background: "#FFFFFF",
-    padding: "20px 24px",
-    borderRadius: "6px",
-    border: "1px solid #E8E8E8",
-    boxSizing: "border-box",
+    background: "#FFF", padding: "20px 24px", borderRadius: "6px",
+    border: "1px solid #E8E8E8", boxSizing: "border-box",
   },
-  kpiLabel: {
-    fontSize: "12px",
-    fontWeight: "500",
-    color: "#9C9C9C",
-    textTransform: "uppercase",
-    letterSpacing: "0.4px",
-    marginBottom: "8px",
-  },
-  kpiValue: {
-    fontSize: "28px",
-    fontWeight: "600",
-    color: "#1C1C1C",
-  },
+  kpiLabel: { fontSize: "11px", fontWeight: "600", color: "#9C9C9C", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: "8px" },
+  kpiValue: { fontSize: "28px", fontWeight: "700", color: "#1C1C1C" },
   section: {
-    background: "#FFFFFF",
-    borderRadius: "6px",
-    padding: "20px",
-    marginBottom: "20px",
-    border: "1px solid #E8E8E8",
-    width: "100%",
-    boxSizing: "border-box",
+    background: "#FFF", borderRadius: "6px", padding: "20px",
+    marginBottom: "20px", border: "1px solid #E8E8E8", boxSizing: "border-box",
   },
   sectionHeader: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    marginBottom: "20px",
-    paddingBottom: "16px",
-    borderBottom: "1px solid #F0F0F0",
-    flexWrap: "wrap",
-    gap: "12px",
+    display: "flex", justifyContent: "space-between", alignItems: "center",
+    marginBottom: "16px", paddingBottom: "14px", borderBottom: "1px solid #F0F0F0",
   },
-  sectionTitle: {
-    margin: 0,
-    fontSize: "16px",
-    fontWeight: "600",
-    color: "#1C1C1C",
-  },
-  badge: {
-    background: "#F5F5F5",
-    color: "#636363",
-    padding: "4px 10px",
-    borderRadius: "3px",
-    fontSize: "12px",
-    fontWeight: "500",
-    whiteSpace: "nowrap",
-  },
-  tablesContainer: {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))",
-    gap: "12px",
-    width: "100%",
-  },
-  tableItem: {
-    padding: "16px",
-    borderRadius: "4px",
-    border: "1px solid #E8E8E8",
-    boxSizing: "border-box",
-  },
-  tableInfo: { textAlign: "center" },
-  tableNum: { fontSize: "16px", fontWeight: "600", color: "#1C1C1C", marginBottom: "4px" },
-  tableStatus: { fontSize: "12px", fontWeight: "500" },
-  emptyState: {
-    padding: "40px 20px",
-    textAlign: "center",
-    color: "#9C9C9C",
-    fontSize: "14px",
-    background: "#FAFAFA",
-    borderRadius: "4px",
-  },
-  ordersList: { display: "flex", flexDirection: "column", gap: "12px", width: "100%" },
+  sectionTitle: { margin: 0, fontSize: "15px", fontWeight: "600", color: "#1C1C1C" },
+  badge: { background: "#F5F5F5", color: "#636363", padding: "4px 10px", borderRadius: "20px", fontSize: "12px", fontWeight: "500" },
+  tablesContainer: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(130px, 1fr))", gap: "12px" },
+  tableItem: { padding: "16px", borderRadius: "4px", border: "1px solid #E8E8E8", boxSizing: "border-box" },
+  tableNum: { fontSize: "15px", fontWeight: "600", color: "#1C1C1C", marginBottom: "4px", textAlign: "center" },
+  tableStatus: { fontSize: "11px", fontWeight: "500", textAlign: "center" },
+  emptyState: { padding: "40px", textAlign: "center", color: "#9C9C9C", background: "#FAFAFA", borderRadius: "4px" },
+  ordersList: { display: "flex", flexDirection: "column", gap: "10px" },
   orderItem: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "stretch",
-    padding: "16px",
-    background: "#FAFAFA",
-    borderRadius: "4px",
-    border: "1px solid #F0F0F0",
-    gap: "16px",
-    flexWrap: "wrap",
-    width: "100%",
-    boxSizing: "border-box",
+    display: "flex", justifyContent: "space-between", alignItems: "flex-start",
+    padding: "16px", background: "#FAFAFA", borderRadius: "4px",
+    border: "1px solid #F0F0F0", gap: "16px", flexWrap: "wrap", boxSizing: "border-box",
   },
-  orderItemLeft: { flex: "1 1 100%", minWidth: "200px" },
-  orderItemRight: {
-    display: "flex",
-    alignItems: "center",
-    gap: "12px",
-    flexWrap: "wrap",
-    flex: "1 1 auto",
-    minWidth: "250px",
+  orderLeft: { flex: "1 1 200px" },
+  orderRight: {
+    display: "flex", flexDirection: "column", alignItems: "flex-end",
+    gap: "10px", flex: "0 0 auto",
   },
-  orderHeader: {
-    display: "flex",
-    alignItems: "center",
-    gap: "8px",
-    marginBottom: "8px",
-    flexWrap: "wrap",
-  },
+  orderHeader: { display: "flex", alignItems: "center", gap: "8px", marginBottom: "6px", flexWrap: "wrap" },
   orderId: { fontSize: "14px", fontWeight: "600", color: "#1C1C1C" },
-  tableTag: {
-    background: "#E8E8E8",
-    color: "#636363",
-    padding: "3px 8px",
-    borderRadius: "3px",
-    fontSize: "11px",
-    fontWeight: "500",
-    whiteSpace: "nowrap",
-  },
-  orderMeta: { display: "flex", gap: "16px", fontSize: "13px", flexWrap: "wrap", marginBottom: "8px" },
-  customerName: { margin: 0, color: "#636363", fontWeight: "500" },
-  customerPhone: { margin: 0, color: "#9C9C9C", fontSize: "12px" },
-  itemsDetail: { marginTop: "12px", paddingTop: "12px", borderTop: "1px solid #E8E8E8" },
-  itemsLabel: { fontSize: "11px", fontWeight: "600", color: "#1C1C1C", textTransform: "uppercase", marginBottom: "6px" },
-  itemsGrid: { display: "flex", flexDirection: "column", gap: "4px" },
-  itemRow: { display: "flex", alignItems: "center", gap: "8px", fontSize: "12px" },
-  itemQty: {
-    background: "#F0F0F0",
-    color: "#636363",
-    padding: "2px 6px",
-    borderRadius: "2px",
-    fontWeight: "600",
-    minWidth: "30px",
-    textAlign: "center",
-  },
-  itemNameDetail: { color: "#636363", flex: "1 1 auto" },
-  itemPriceDetail: { color: "#1C1C1C", fontWeight: "600", whiteSpace: "nowrap" },
-  amount: { fontSize: "18px", fontWeight: "600", color: "#1C1C1C", whiteSpace: "nowrap" },
-  actionButtons: {
-    display: "flex",
-    gap: "6px",
-    flexWrap: "wrap",
-    justifyContent: "flex-end",
-    flex: "1 1 auto",
-  },
-  btnPrimary: {
-    background: "#388E3C", color: "#FFFFFF", border: "none",
-    padding: "6px 14px", borderRadius: "4px", cursor: "pointer",
-    fontSize: "12px", fontWeight: "500", whiteSpace: "nowrap", minHeight: "36px",
-  },
-  btnWhatsapp: {
-    background: "#25D366", color: "#FFFFFF", border: "none",
-    padding: "6px 14px", borderRadius: "4px", cursor: "pointer",
-    fontSize: "12px", fontWeight: "500", whiteSpace: "nowrap", minHeight: "36px",
-  },
-  btnSecondary: {
-    background: "#F57C00", color: "#FFFFFF", border: "none",
-    padding: "6px 14px", borderRadius: "4px", cursor: "pointer",
-    fontSize: "12px", fontWeight: "500", whiteSpace: "nowrap", minHeight: "36px",
-  },
+  tag: { background: "#E8E8E8", color: "#636363", padding: "2px 8px", borderRadius: "3px", fontSize: "11px", fontWeight: "500" },
+  orderMeta: { display: "flex", gap: "12px", marginBottom: "10px", flexWrap: "wrap" },
+  customerName: { fontSize: "13px", color: "#636363", fontWeight: "500" },
+  customerPhone: { fontSize: "12px", color: "#9C9C9C" },
+  itemsDetail: { borderTop: "1px solid #E8E8E8", paddingTop: "10px" },
+  itemsLabel: { fontSize: "10px", fontWeight: "700", color: "#9C9C9C", letterSpacing: "0.5px", marginBottom: "6px" },
+  itemRow: { display: "flex", alignItems: "center", gap: "8px", fontSize: "12px", marginBottom: "3px" },
+  itemQty: { background: "#F0F0F0", color: "#636363", padding: "1px 6px", borderRadius: "3px", fontWeight: "600", minWidth: "28px", textAlign: "center" },
+  itemName: { color: "#636363", flex: 1 },
+  itemPrice: { color: "#1C1C1C", fontWeight: "600" },
+  amount: { fontSize: "20px", fontWeight: "700", color: "#1C1C1C" },
+  actionButtons: { display: "flex", gap: "6px", flexWrap: "wrap", justifyContent: "flex-end" },
+  btnGreen:  { background: "#388E3C", color: "#FFF", border: "none", padding: "7px 14px", borderRadius: "4px", cursor: "pointer", fontSize: "12px", fontWeight: "500", minHeight: "36px" },
+  btnWA:     { background: "#25D366", color: "#FFF", border: "none", padding: "7px 14px", borderRadius: "4px", cursor: "pointer", fontSize: "12px", fontWeight: "500", minHeight: "36px" },
+  btnOrange: { background: "#F57C00", color: "#FFF", border: "none", padding: "7px 14px", borderRadius: "4px", cursor: "pointer", fontSize: "12px", fontWeight: "500", minHeight: "36px" },
 };
 
-/* ── MEDIA QUERIES ── */
 const mediaQueries = `
   * { box-sizing: border-box; }
 
   @media (min-width: 1024px) {
     .kpi-grid { grid-template-columns: repeat(4, 1fr) !important; }
     .order-item { flex-wrap: nowrap !important; }
-    .order-item-left { flex: 1 1 auto !important; }
-    .order-item-right { flex: 0 0 auto !important; }
+    .order-right { flex-direction: row !important; align-items: center !important; }
   }
 
   @media (max-width: 768px) {
     .kpi-grid { grid-template-columns: repeat(2, 1fr) !important; gap: 10px !important; }
-    .kpi-value { font-size: 22px !important; }
     .order-item { flex-direction: column !important; }
-    .order-item-right { flex: 1 1 100% !important; min-width: auto !important; }
-    .action-buttons { justify-content: stretch !important; }
-    .btn-primary, .btn-whatsapp, .btn-secondary {
-      flex: 1 1 calc(33.333% - 4px) !important;
-      text-align: center;
-      justify-content: center;
-    }
-    .amount { text-align: left !important; margin-bottom: 8px !important; }
+    .order-right { flex-direction: row !important; width: 100% !important; justify-content: space-between !important; align-items: center !important; }
+    .action-buttons { justify-content: flex-end !important; }
     .tables-container { grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)) !important; }
   }
 
   @media (max-width: 480px) {
     .main-content { padding: 10px 8px !important; }
     .section { padding: 12px !important; }
-    .kpi-card { padding: 12px !important; }
-    .kpi-label { font-size: 10px !important; }
-    .kpi-value { font-size: 18px !important; }
-    .section-title { font-size: 13px !important; }
-    .tables-container { grid-template-columns: repeat(auto-fill, minmax(80px, 1fr)) !important; }
-    .order-id { font-size: 12px !important; }
-    .btn-primary, .btn-whatsapp, .btn-secondary { font-size: 10px !important; padding: 5px 6px !important; }
+    .kpi-card { padding: 14px !important; }
+    .action-buttons { width: 100% !important; }
+    .action-buttons button { flex: 1 !important; }
   }
 
   @media (hover: none) and (pointer: coarse) {
-    button { min-height: 44px; -webkit-tap-highlight-color: transparent; }
-    .btn-primary, .btn-whatsapp, .btn-secondary { min-height: 40px !important; }
+    button { min-height: 44px !important; -webkit-tap-highlight-color: transparent; }
   }
 `;
 
