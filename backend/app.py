@@ -10,8 +10,10 @@ eventlet.monkey_patch()
 # ============================================================
 
 import os
+import csv
+import io
 import json
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required
 from flask_socketio import SocketIO
@@ -33,8 +35,8 @@ app.config.update(
     JWT_SECRET_KEY           = os.getenv("JWT_SECRET_KEY", "super-secret-key"),
     JWT_ACCESS_TOKEN_EXPIRES = 3600,
     CACHE_TYPE               = "SimpleCache",
-    CACHE_DEFAULT_TIMEOUT    = 5,       # 5s default — fresh but fast
-    JSON_SORT_KEYS           = False,   # ✅ skip sorting JSON keys = faster responses
+    CACHE_DEFAULT_TIMEOUT    = 5,
+    JSON_SORT_KEYS           = False,
     PROPAGATE_EXCEPTIONS     = True,
 )
 
@@ -53,7 +55,7 @@ socketio = SocketIO(
     async_mode="eventlet",
     ping_timeout=20,
     ping_interval=10,
-    logger=False,       # ✅ no logging overhead
+    logger=False,
     engineio_logger=False,
 )
 
@@ -93,7 +95,6 @@ def get_tables():
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        # ✅ Only fetch columns we need
         cursor.execute("SELECT id, number, status FROM tables ORDER BY id ASC")
         return jsonify(cursor.fetchall())
     finally:
@@ -143,7 +144,6 @@ def create_order():
         conn = get_connection()
         cursor = conn.cursor()
 
-        # ✅ Both inserts in one transaction — single commit
         cursor.execute("""
             INSERT INTO orders
                 (table_id, items, total, status, customer_name, whatsapp, session_id)
@@ -166,7 +166,8 @@ def create_order():
         )
         conn.commit()
 
-        cache.delete_many("all_tables", "all_orders", "total_income")
+        cache.delete_many("all_tables", "all_orders", "total_income",
+                          "stats_daily", "stats_monthly")
         emit("new_order", {"message": "New order received", "order_id": order_id})
 
         return jsonify({"message": "Order created successfully", "order_id": order_id}), 201
@@ -187,7 +188,6 @@ def get_orders():
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        # ✅ Uses idx_orders_created_at index
         cursor.execute("""
             SELECT id, table_id, items, total, status,
                    customer_name, whatsapp, session_id, created_at
@@ -204,7 +204,6 @@ def get_session_orders(session_id):
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        # ✅ Uses idx_orders_session_id index
         cursor.execute("""
             SELECT id, table_id, items, total, status,
                    customer_name, whatsapp, session_id, created_at
@@ -226,7 +225,6 @@ def get_orders_by_table(table_id):
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        # ✅ Uses idx_orders_table_session composite index
         cursor.execute("""
             SELECT id, table_id, items, total, status,
                    customer_name, whatsapp, session_id, created_at
@@ -267,7 +265,6 @@ def mark_paid(order_id):
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        # ✅ RETURNING avoids a second SELECT query
         cursor.execute(
             "UPDATE orders SET status='paid' WHERE id=%s RETURNING table_id",
             (order_id,)
@@ -280,7 +277,8 @@ def mark_paid(order_id):
         cursor.execute("UPDATE tables SET status='free' WHERE id=%s", (table_id,))
         conn.commit()
 
-        cache.delete_many("all_tables", "all_orders", "total_income")
+        cache.delete_many("all_tables", "all_orders", "total_income",
+                          "stats_daily", "stats_monthly")
         emit("order_updated", {"order_id": order_id})
         emit("table_updated", {"table_id": table_id})
 
@@ -300,12 +298,147 @@ def total_income():
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        # ✅ Uses idx_orders_status index
         cursor.execute(
             "SELECT COALESCE(SUM(total), 0) AS income FROM orders WHERE status='paid'"
         )
         row = cursor.fetchone()
         return jsonify({"total_income": float(row["income"])})
+    finally:
+        release_connection(conn)
+
+
+# ============================================================
+#                   ROUTES — STATS
+# ============================================================
+
+@app.route("/stats/daily", methods=["GET"])
+@jwt_required()
+@cache.cached(timeout=60, key_prefix="stats_daily")
+def stats_daily():
+    """Daily stats for last 30 days: date, orders, income, avg order value."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT
+                DATE(created_at)                               AS date,
+                COUNT(*)                                       AS total_orders,
+                COALESCE(SUM(total), 0)                        AS total_income,
+                COALESCE(ROUND(AVG(total)::NUMERIC, 2), 0)     AS avg_order_value
+            FROM orders
+            WHERE status = 'paid'
+              AND created_at >= CURRENT_DATE - INTERVAL '30 days'
+            GROUP BY DATE(created_at)
+            ORDER BY date DESC
+        """)
+        rows = cursor.fetchall()
+        for row in rows:
+            row["date"]            = str(row["date"])
+            row["total_income"]    = float(row["total_income"])
+            row["avg_order_value"] = float(row["avg_order_value"])
+        return jsonify(rows)
+    finally:
+        release_connection(conn)
+
+
+@app.route("/stats/monthly", methods=["GET"])
+@jwt_required()
+@cache.cached(timeout=60, key_prefix="stats_monthly")
+def stats_monthly():
+    """Monthly stats for last 12 months: month, orders, income, avg, best day."""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT
+                EXTRACT(YEAR  FROM created_at)::INT            AS year,
+                EXTRACT(MONTH FROM created_at)::INT            AS month,
+                TO_CHAR(created_at, 'Mon YYYY')                AS month_label,
+                COUNT(*)                                       AS total_orders,
+                COALESCE(SUM(total), 0)                        AS total_income,
+                COALESCE(ROUND(AVG(total)::NUMERIC, 2), 0)     AS avg_order_value,
+                MODE() WITHIN GROUP (
+                    ORDER BY TO_CHAR(created_at, 'Day')
+                )                                              AS best_day
+            FROM orders
+            WHERE status = 'paid'
+              AND created_at >= CURRENT_DATE - INTERVAL '12 months'
+            GROUP BY year, month, month_label
+            ORDER BY year DESC, month DESC
+        """)
+        rows = cursor.fetchall()
+        for row in rows:
+            row["total_income"]    = float(row["total_income"])
+            row["avg_order_value"] = float(row["avg_order_value"])
+        return jsonify(rows)
+    finally:
+        release_connection(conn)
+
+
+@app.route("/stats/monthly/csv", methods=["GET"])
+@jwt_required()
+def monthly_csv():
+    """Download all paid orders for a given month as CSV. ?month=YYYY-MM"""
+    month = request.args.get("month")  # e.g. "2026-02", defaults to current month
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+
+        if month:
+            cursor.execute("""
+                SELECT id, table_id, customer_name, whatsapp,
+                       items, total, created_at
+                FROM orders
+                WHERE status = 'paid'
+                  AND TO_CHAR(created_at, 'YYYY-MM') = %s
+                ORDER BY created_at ASC
+            """, (month,))
+        else:
+            cursor.execute("""
+                SELECT id, table_id, customer_name, whatsapp,
+                       items, total, created_at
+                FROM orders
+                WHERE status = 'paid'
+                  AND DATE_TRUNC('month', created_at) = DATE_TRUNC('month', CURRENT_DATE)
+                ORDER BY created_at ASC
+            """)
+
+        rows = cursor.fetchall()
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+
+        writer.writerow([
+            "Order ID", "Date", "Time", "Table",
+            "Customer", "WhatsApp", "Items", "Total (Rs.)"
+        ])
+
+        for row in rows:
+            items_data    = json.loads(row["items"]) if row.get("items") else []
+            items_summary = " | ".join(
+                f"{item['name']} x{item['quantity']}" for item in items_data
+            )
+            dt = row["created_at"]
+            writer.writerow([
+                row["id"],
+                dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)[:10],
+                dt.strftime("%H:%M")    if hasattr(dt, "strftime") else str(dt)[11:16],
+                f"Table {row['table_id']}",
+                row["customer_name"],
+                row["whatsapp"],
+                items_summary,
+                float(row["total"]),
+            ])
+
+        output.seek(0)
+        filename = f"orders_{month or 'this_month'}.csv"
+
+        return Response(
+            output.getvalue(),
+            mimetype="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
     finally:
         release_connection(conn)
 
