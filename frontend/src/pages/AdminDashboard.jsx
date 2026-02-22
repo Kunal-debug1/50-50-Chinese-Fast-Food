@@ -47,7 +47,11 @@ function AdminDashboard() {
   const [orders,     setOrders]     = useState([]);
   const [income,     setIncome]     = useState(0);
   const [loading,    setLoading]    = useState(true);
-  const [itemStatus, setItemStatus] = useState({});
+
+  // ── Persist itemStatus to localStorage so it survives page refreshes ──
+  const [itemStatus, setItemStatus] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("itemStatus") || "{}"); } catch { return {}; }
+  });
 
   // stats state
   const [daily,        setDaily]        = useState([]);
@@ -58,6 +62,11 @@ function AdminDashboard() {
 
   const prevPendingIds = useRef(null);
   const pollingRef     = useRef(null);
+
+  // Sync itemStatus to localStorage whenever it changes
+  useEffect(() => {
+    localStorage.setItem("itemStatus", JSON.stringify(itemStatus));
+  }, [itemStatus]);
 
   const handleLogout = () => {
     clearInterval(pollingRef.current);
