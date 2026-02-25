@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 
 const API = "https://five0-50-chinese-fast-food-6.onrender.com";
-const POLL_INTERVAL = 5000;
+const POLL_INTERVAL = 6000; // page-level fallback polling every 6s
 
 // ── Month options for CSV picker ──
 function getMonthOptions() {
@@ -19,18 +19,17 @@ function getMonthOptions() {
 
 // ── Register & init service worker ──
 async function registerSW(token, knownIds) {
-  if (!("serviceWorker" in navigator)) return null;
+  if (!("serviceWorker" in navigator)) return;
   try {
     const reg = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
     await navigator.serviceWorker.ready;
+    // Send INIT to whichever SW is active
     const sw = reg.active || reg.waiting || reg.installing;
     if (sw) {
       sw.postMessage({ type: "INIT", token, knownIds: [...knownIds] });
     }
-    return reg;
   } catch (e) {
     console.error("SW register failed:", e);
-    return null;
   }
 }
 
@@ -42,7 +41,6 @@ function AdminDashboard() {
     if (!token) navigate("/admin-login", { replace: true });
   }, []);
 
-  // ── tabs: "orders" | "stats" ──
   const [tab, setTab] = useState("orders");
   const [tables, setTables] = useState([]);
   const [orders, setOrders] = useState([]);
@@ -52,7 +50,6 @@ function AdminDashboard() {
     typeof Notification !== "undefined" ? Notification.permission : "default"
   );
 
-  // ── Persist itemStatus to localStorage so it survives page refreshes ──
   const [itemStatus, setItemStatus] = useState(() => {
     try {
       return JSON.parse(localStorage.getItem("itemStatus") || "{}");
@@ -61,7 +58,6 @@ function AdminDashboard() {
     }
   });
 
-  // stats state
   const [daily, setDaily] = useState([]);
   const [monthly, setMonthly] = useState([]);
   const [statsLoading, setStatsLoading] = useState(false);
@@ -70,8 +66,8 @@ function AdminDashboard() {
 
   const prevPendingIds = useRef(new Set());
   const pollingRef = useRef(null);
+  const fetchingRef = useRef(false); // prevent overlapping fetches
 
-  // Sync itemStatus to localStorage whenever it changes
   useEffect(() => {
     localStorage.setItem("itemStatus", JSON.stringify(itemStatus));
   }, [itemStatus]);
@@ -87,7 +83,6 @@ function AdminDashboard() {
 
   const authH = () => ({ Authorization: "Bearer " + token });
 
-  // ── Request notification permission & register SW ──
   const setupNotifications = useCallback(async () => {
     if (!("Notification" in window)) return;
     let perm = Notification.permission;
@@ -100,13 +95,17 @@ function AdminDashboard() {
     }
   }, [token]);
 
-  // ── Fetch orders / tables / income ──
+  // ── Core fetch — called by page polling, SW pings, and visibility changes ──
   const fetchAll = useCallback(async (isBackground = false) => {
+    // Skip if already fetching to avoid overlapping requests
+    if (fetchingRef.current) return;
+    fetchingRef.current = true;
+
     try {
       const [tRes, oRes, iRes] = await Promise.all([
-        fetch(`${API}/tables`),
-        fetch(`${API}/orders`, { headers: authH() }),
-        fetch(`${API}/income`, { headers: authH() }),
+        fetch(`${API}/tables`, { cache: "no-store" }),
+        fetch(`${API}/orders`, { headers: authH(), cache: "no-store" }),
+        fetch(`${API}/income`, { headers: authH(), cache: "no-store" }),
       ]);
 
       if (oRes.status === 401 || iRes.status === 401) {
@@ -120,40 +119,26 @@ function AdminDashboard() {
         iRes.json(),
       ]);
 
-      const currentIds = new Set(oData.filter(o => o.status !== "paid").map(o => String(o.id)));
+      const currentIds = new Set(
+        oData.filter((o) => o.status !== "paid").map((o) => String(o.id))
+      );
 
-      if (isBackground && prevPendingIds.current.size > 0) {
-        const hasNew = [...currentIds].some(id => !prevPendingIds.current.has(id));
-        if (hasNew) {
-          setItemStatus(prev => {
-            const next = { ...prev };
-            oData
-              .filter(o => o.status !== "paid" && !prev[o.id])
-              .forEach(o => {
-                next[o.id] = Object.fromEntries(
-                  (o.items || []).map((_, i) => [i, "pending"])
-                );
-              });
-            return next;
+      // Update item status for any new orders we haven't seen yet
+      setItemStatus((prev) => {
+        const next = { ...prev };
+        oData
+          .filter((o) => o.status !== "paid" && !prev[o.id])
+          .forEach((o) => {
+            next[o.id] = Object.fromEntries(
+              (o.items || []).map((_, i) => [i, "pending"])
+            );
           });
-        }
-      } else if (!isBackground) {
-        setItemStatus(prev => {
-          const next = { ...prev };
-          oData
-            .filter(o => o.status !== "paid" && !prev[o.id])
-            .forEach(o => {
-              next[o.id] = Object.fromEntries(
-                (o.items || []).map((_, i) => [i, "pending"])
-              );
-            });
-          return next;
-        });
-      }
+        return next;
+      });
 
       prevPendingIds.current = currentIds;
 
-      // Keep service worker in sync with latest known IDs
+      // Keep SW in sync with known IDs
       if (navigator.serviceWorker?.controller) {
         navigator.serviceWorker.controller.postMessage({
           type: "UPDATE_IDS",
@@ -167,11 +152,11 @@ function AdminDashboard() {
     } catch (e) {
       console.error("fetchAll:", e);
     } finally {
+      fetchingRef.current = false;
       if (!isBackground) setLoading(false);
     }
   }, [token]);
 
-  // ── Fetch stats ──
   const fetchStats = useCallback(async () => {
     setStatsLoading(true);
     try {
@@ -191,41 +176,51 @@ function AdminDashboard() {
   useEffect(() => {
     if (!token) return;
 
-    setupNotifications();
+    // Initial load + notification setup
     fetchAll(false);
+    setupNotifications();
 
-    // Page-level polling (works when page is visible/active)
+    // Page-level polling — backup in case SW isn't available
     pollingRef.current = setInterval(() => fetchAll(true), POLL_INTERVAL);
 
-    // Listen for NEW_ORDER messages from service worker
+    // ── Listen to SW messages ──
     const onSWMessage = (event) => {
-      if (event.data?.type === "NEW_ORDER") {
-        fetchAll(false);
+      if (event.data?.type === "PING" || event.data?.type === "NEW_ORDER") {
+        // SW is telling us to refresh — do it immediately
+        fetchAll(true);
       }
     };
     navigator.serviceWorker?.addEventListener("message", onSWMessage);
 
-    // Refresh immediately when user comes back to the page
+    // ── Refresh instantly when user opens/returns to the page ──
     const onVisibility = () => {
       if (document.visibilityState === "visible") {
-        fetchAll(false);
+        // Reset polling timer so it runs fresh from now
+        clearInterval(pollingRef.current);
+        fetchAll(false); // immediate full refresh
+        pollingRef.current = setInterval(() => fetchAll(true), POLL_INTERVAL);
       }
     };
     document.addEventListener("visibilitychange", onVisibility);
+
+    // ── Refresh when page gains focus (e.g. switching back from another app) ──
+    const onFocus = () => {
+      fetchAll(false);
+    };
+    window.addEventListener("focus", onFocus);
 
     return () => {
       clearInterval(pollingRef.current);
       navigator.serviceWorker?.removeEventListener("message", onSWMessage);
       document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("focus", onFocus);
     };
   }, []);
 
-  // Load stats when switching to stats tab
   useEffect(() => {
     if (tab === "stats" && daily.length === 0) fetchStats();
   }, [tab]);
 
-  // ── CSV download ──
   const downloadCSV = async () => {
     setCsvLoading(true);
     try {
@@ -247,9 +242,8 @@ function AdminDashboard() {
     }
   };
 
-  // ── Order actions ──
   const toggleItem = (orderId, itemIdx) => {
-    setItemStatus(prev => ({
+    setItemStatus((prev) => ({
       ...prev,
       [orderId]: {
         ...prev[orderId],
@@ -265,8 +259,8 @@ function AdminDashboard() {
       body: JSON.stringify({ status }),
     });
     if (status === "ready") {
-      setItemStatus(prev => {
-        const order = orders.find(o => o.id === orderId);
+      setItemStatus((prev) => {
+        const order = orders.find((o) => o.id === orderId);
         if (!order) return prev;
         return {
           ...prev,
@@ -280,8 +274,11 @@ function AdminDashboard() {
   };
 
   const markPaid = async (orderId) => {
-    await fetch(`${API}/orders/${orderId}/pay`, { method: "PUT", headers: authH() });
-    setItemStatus(prev => {
+    await fetch(`${API}/orders/${orderId}/pay`, {
+      method: "PUT",
+      headers: authH(),
+    });
+    setItemStatus((prev) => {
       const n = { ...prev };
       delete n[orderId];
       return n;
@@ -299,17 +296,23 @@ function AdminDashboard() {
           `${i + 1}. ${item.name}\n   Qty: ${item.quantity} × ₹${item.price}\n   Amount: ₹${item.price * item.quantity}`
       )
       .join("\n\n");
-    const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const time = new Date().toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
     const msg = `*50-50 CHINESE FAST FOOD*\nCIDCO, Chhatrapati Sambhajinagar\n\n============================\n        INVOICE\n============================\n\nOrder ID : ${order.id}\nTable No : ${order.table_id}\nCustomer : ${order.customer_name}\nTime     : ${time}\n\n----------------------------\n      ITEM DETAILS\n----------------------------\n\n${itemsList}\n\n----------------------------\n TOTAL PAYABLE : Rs.${order.total}\n----------------------------\n\n  Thank you for dining with us!\n  We look forward to serving you again.\n\n  Feedback & Enquiry:\n  +91-88301 46272\n\n============================\n   *50-50 CHINESE FAST FOOD*\n============================`;
-    window.open(`https://wa.me/${phone}?text=${encodeURIComponent(msg)}`, "_blank");
+    window.open(
+      `https://wa.me/${phone}?text=${encodeURIComponent(msg)}`,
+      "_blank"
+    );
   };
 
-  const pendingOrders = orders.filter(o => o.status !== "paid");
-  const paidOrders = orders.filter(o => o.status === "paid");
+  const pendingOrders = orders.filter((o) => o.status !== "paid");
+  const paidOrders = orders.filter((o) => o.status === "paid");
   const monthOpts = getMonthOptions();
 
   const todayStr = new Date().toISOString().slice(0, 10);
-  const todayStats = daily.find(d => d.date === todayStr) || {
+  const todayStats = daily.find((d) => d.date === todayStr) || {
     total_orders: 0,
     total_income: 0,
     avg_order_value: 0,
@@ -350,8 +353,8 @@ function AdminDashboard() {
       {notifStatus !== "granted" && (
         <div style={S.notifBanner}>
           {notifStatus === "denied"
-            ? "⚠️ Notifications blocked. Go to browser Site Settings → Notifications → Allow for this site."
-            : "🔔 Enable notifications to get alerted when new orders arrive on this device."}
+            ? "⚠️ Notifications blocked. Go to browser Site Settings → Notifications → Allow."
+            : "🔔 Enable notifications to get alerted for new orders on this device."}
           {notifStatus !== "denied" && (
             <button style={S.notifBtn} onClick={setupNotifications}>
               Enable Notifications
@@ -374,7 +377,7 @@ function AdminDashboard() {
                   { label: "Total Orders", value: orders.length, color: "#1C1C1C" },
                   { label: "Pending", value: pendingOrders.length, color: "#D32F2F" },
                   { label: "Completed", value: paidOrders.length, color: "#388E3C" },
-                ].map(k => (
+                ].map((k) => (
                   <div key={k.label} style={S.kpiCard}>
                     <div style={S.kpiLabel}>{k.label}</div>
                     <div style={{ ...S.kpiValue, color: k.color }}>{k.value}</div>
@@ -389,7 +392,7 @@ function AdminDashboard() {
                   <span style={S.badge}>{tables.length} tables</span>
                 </div>
                 <div style={S.tblGrid} className="tbl-grid">
-                  {tables.map(t => (
+                  {tables.map((t) => (
                     <div
                       key={t.number}
                       style={{
@@ -416,16 +419,20 @@ function AdminDashboard() {
               <div style={S.section}>
                 <div style={S.secHead}>
                   <span style={S.secTitle}>Pending Orders</span>
-                  <span style={{ ...S.badge, background: "#FFEBEE", color: "#D32F2F" }}>
+                  <span
+                    style={{ ...S.badge, background: "#FFEBEE", color: "#D32F2F" }}
+                  >
                     {pendingOrders.length}
                   </span>
                 </div>
                 {pendingOrders.length === 0 ? (
                   <div style={S.empty}>No pending orders 🎉</div>
                 ) : (
-                  pendingOrders.map(o => {
+                  pendingOrders.map((o) => {
                     const iStatus = itemStatus[o.id] || {};
-                    const allReady = (o.items || []).every((_, i) => iStatus[i] === "ready");
+                    const allReady = (o.items || []).every(
+                      (_, i) => iStatus[i] === "ready"
+                    );
                     return (
                       <div key={o.id} style={S.orderCard} className="order-card">
                         <div style={S.orderLeft}>
@@ -515,7 +522,10 @@ function AdminDashboard() {
                             <button style={S.btnWA} onClick={() => sendWhatsApp(o)}>
                               Send Bill
                             </button>
-                            <button style={S.btnOrange} onClick={() => markPaid(o.id)}>
+                            <button
+                              style={S.btnOrange}
+                              onClick={() => markPaid(o.id)}
+                            >
                               Paid ✓
                             </button>
                           </div>
@@ -530,14 +540,16 @@ function AdminDashboard() {
               <div style={S.section}>
                 <div style={S.secHead}>
                   <span style={S.secTitle}>Completed Orders</span>
-                  <span style={{ ...S.badge, background: "#E8F5E9", color: "#388E3C" }}>
+                  <span
+                    style={{ ...S.badge, background: "#E8F5E9", color: "#388E3C" }}
+                  >
                     {paidOrders.length}
                   </span>
                 </div>
                 {paidOrders.length === 0 ? (
                   <div style={S.empty}>No completed orders</div>
                 ) : (
-                  paidOrders.map(o => (
+                  paidOrders.map((o) => (
                     <div key={o.id} style={S.orderCard} className="order-card">
                       <div style={S.orderLeft}>
                         <div style={S.orderTopRow}>
@@ -572,14 +584,13 @@ function AdminDashboard() {
         ) : (
           <>
             <div style={S.wrap}>
-              {/* ── TODAY + THIS MONTH SUMMARY ── */}
               <div style={S.kpiGrid} className="kpi-grid">
                 {[
                   { label: "Today's Income", value: `₹ ${todayStats.total_income}`, color: "#1C1C1C" },
                   { label: "Today's Orders", value: todayStats.total_orders, color: "#1C1C1C" },
                   { label: "This Month Income", value: `₹ ${thisMonth.total_income}`, color: "#1565C0" },
                   { label: "This Month Orders", value: thisMonth.total_orders, color: "#1565C0" },
-                ].map(k => (
+                ].map((k) => (
                   <div key={k.label} style={S.kpiCard}>
                     <div style={S.kpiLabel}>{k.label}</div>
                     <div style={{ ...S.kpiValue, color: k.color }}>{k.value}</div>
@@ -587,7 +598,6 @@ function AdminDashboard() {
                 ))}
               </div>
 
-              {/* ── CSV DOWNLOAD ── */}
               <div style={S.section}>
                 <div style={S.secHead}>
                   <span style={S.secTitle}>📥 Download Monthly Report</span>
@@ -595,10 +605,10 @@ function AdminDashboard() {
                 <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
                   <select
                     value={csvMonth}
-                    onChange={e => setCsvMonth(e.target.value)}
+                    onChange={(e) => setCsvMonth(e.target.value)}
                     style={S.select}
                   >
-                    {monthOpts.map(m => (
+                    {monthOpts.map((m) => (
                       <option key={m.value} value={m.value}>
                         {m.label}
                       </option>
@@ -613,7 +623,6 @@ function AdminDashboard() {
                 </div>
               </div>
 
-              {/* ── DAILY STATS TABLE (last 30 days) ── */}
               <div style={S.section}>
                 <div style={S.secHead}>
                   <span style={S.secTitle}>📅 Daily Breakdown (Last 30 Days)</span>
@@ -628,10 +637,8 @@ function AdminDashboard() {
                     <table style={S.table}>
                       <thead>
                         <tr>
-                          {["Date", "Orders", "Income (₹)", "Avg Order (₹)"].map(h => (
-                            <th key={h} style={S.th}>
-                              {h}
-                            </th>
+                          {["Date", "Orders", "Income (₹)", "Avg Order (₹)"].map((h) => (
+                            <th key={h} style={S.th}>{h}</th>
                           ))}
                         </tr>
                       </thead>
@@ -647,9 +654,7 @@ function AdminDashboard() {
                         <tr style={{ background: "#F0F4FF", fontWeight: 700 }}>
                           <td style={S.td}>Total</td>
                           <td style={S.td}>{daily.reduce((s, d) => s + d.total_orders, 0)}</td>
-                          <td style={S.td}>
-                            ₹ {daily.reduce((s, d) => s + d.total_income, 0).toFixed(2)}
-                          </td>
+                          <td style={S.td}>₹ {daily.reduce((s, d) => s + d.total_income, 0).toFixed(2)}</td>
                           <td style={S.td}></td>
                         </tr>
                       </tbody>
@@ -658,7 +663,6 @@ function AdminDashboard() {
                 )}
               </div>
 
-              {/* ── MONTHLY STATS TABLE ── */}
               <div style={S.section}>
                 <div style={S.secHead}>
                   <span style={S.secTitle}>📆 Monthly Summary (Last 12 Months)</span>
@@ -670,10 +674,8 @@ function AdminDashboard() {
                     <table style={S.table}>
                       <thead>
                         <tr>
-                          {["Month", "Orders", "Income (₹)", "Avg Order (₹)", "Best Day"].map(h => (
-                            <th key={h} style={S.th}>
-                              {h}
-                            </th>
+                          {["Month", "Orders", "Income (₹)", "Avg Order (₹)", "Best Day"].map((h) => (
+                            <th key={h} style={S.th}>{h}</th>
                           ))}
                         </tr>
                       </thead>
@@ -941,7 +943,6 @@ const S = {
     fontWeight: "600",
     minHeight: "34px",
   },
-  // stats
   select: {
     padding: "9px 12px",
     borderRadius: "4px",
