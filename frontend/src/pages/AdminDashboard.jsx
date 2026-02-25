@@ -4,16 +4,6 @@ import { useNavigate } from "react-router-dom";
 const API = "https://five0-50-chinese-fast-food-6.onrender.com";
 const POLL_INTERVAL = 5000;
 
-function notifyNewOrder() {
-  if (Notification.permission === "granted") {
-    new Notification("🚨 New Order!", {
-      body: "A new order just came in!",
-      icon: "/logo.png",
-      requireInteraction: true, // stays on screen until dismissed
-    });
-  }
-}
-
 // ── Month options for CSV picker ──
 function getMonthOptions() {
   const opts = [];
@@ -25,6 +15,23 @@ function getMonthOptions() {
     opts.push({ value, label });
   }
   return opts;
+}
+
+// ── Register & init service worker ──
+async function registerSW(token, knownIds) {
+  if (!("serviceWorker" in navigator)) return null;
+  try {
+    const reg = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+    await navigator.serviceWorker.ready;
+    const sw = reg.active || reg.waiting || reg.installing;
+    if (sw) {
+      sw.postMessage({ type: "INIT", token, knownIds: [...knownIds] });
+    }
+    return reg;
+  } catch (e) {
+    console.error("SW register failed:", e);
+    return null;
+  }
 }
 
 function AdminDashboard() {
@@ -41,6 +48,9 @@ function AdminDashboard() {
   const [orders, setOrders] = useState([]);
   const [income, setIncome] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [notifStatus, setNotifStatus] = useState(
+    typeof Notification !== "undefined" ? Notification.permission : "default"
+  );
 
   // ── Persist itemStatus to localStorage so it survives page refreshes ──
   const [itemStatus, setItemStatus] = useState(() => {
@@ -58,7 +68,7 @@ function AdminDashboard() {
   const [csvMonth, setCsvMonth] = useState(getMonthOptions()[0].value);
   const [csvLoading, setCsvLoading] = useState(false);
 
-  const prevPendingIds = useRef(null);
+  const prevPendingIds = useRef(new Set());
   const pollingRef = useRef(null);
 
   // Sync itemStatus to localStorage whenever it changes
@@ -68,11 +78,27 @@ function AdminDashboard() {
 
   const handleLogout = () => {
     clearInterval(pollingRef.current);
+    if (navigator.serviceWorker?.controller) {
+      navigator.serviceWorker.controller.postMessage({ type: "STOP" });
+    }
     localStorage.removeItem("adminToken");
     navigate("/admin-login", { replace: true });
   };
 
   const authH = () => ({ Authorization: "Bearer " + token });
+
+  // ── Request notification permission & register SW ──
+  const setupNotifications = useCallback(async () => {
+    if (!("Notification" in window)) return;
+    let perm = Notification.permission;
+    if (perm === "default") {
+      perm = await Notification.requestPermission();
+      setNotifStatus(perm);
+    }
+    if (perm === "granted") {
+      await registerSW(token, prevPendingIds.current);
+    }
+  }, [token]);
 
   // ── Fetch orders / tables / income ──
   const fetchAll = useCallback(async (isBackground = false) => {
@@ -94,11 +120,11 @@ function AdminDashboard() {
         iRes.json(),
       ]);
 
-      if (isBackground && prevPendingIds.current !== null) {
-        const currentIds = new Set(oData.filter(o => o.status !== "paid").map(o => o.id));
+      const currentIds = new Set(oData.filter(o => o.status !== "paid").map(o => String(o.id)));
+
+      if (isBackground && prevPendingIds.current.size > 0) {
         const hasNew = [...currentIds].some(id => !prevPendingIds.current.has(id));
         if (hasNew) {
-          notifyNewOrder();
           setItemStatus(prev => {
             const next = { ...prev };
             oData
@@ -111,11 +137,7 @@ function AdminDashboard() {
             return next;
           });
         }
-        prevPendingIds.current = currentIds;
-      } else {
-        prevPendingIds.current = new Set(
-          oData.filter(o => o.status !== "paid").map(o => o.id)
-        );
+      } else if (!isBackground) {
         setItemStatus(prev => {
           const next = { ...prev };
           oData
@@ -126,6 +148,16 @@ function AdminDashboard() {
               );
             });
           return next;
+        });
+      }
+
+      prevPendingIds.current = currentIds;
+
+      // Keep service worker in sync with latest known IDs
+      if (navigator.serviceWorker?.controller) {
+        navigator.serviceWorker.controller.postMessage({
+          type: "UPDATE_IDS",
+          knownIds: [...currentIds],
         });
       }
 
@@ -158,10 +190,34 @@ function AdminDashboard() {
 
   useEffect(() => {
     if (!token) return;
-    if (Notification.permission === "default") Notification.requestPermission();
+
+    setupNotifications();
     fetchAll(false);
+
+    // Page-level polling (works when page is visible/active)
     pollingRef.current = setInterval(() => fetchAll(true), POLL_INTERVAL);
-    return () => clearInterval(pollingRef.current);
+
+    // Listen for NEW_ORDER messages from service worker
+    const onSWMessage = (event) => {
+      if (event.data?.type === "NEW_ORDER") {
+        fetchAll(false);
+      }
+    };
+    navigator.serviceWorker?.addEventListener("message", onSWMessage);
+
+    // Refresh immediately when user comes back to the page
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        fetchAll(false);
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+
+    return () => {
+      clearInterval(pollingRef.current);
+      navigator.serviceWorker?.removeEventListener("message", onSWMessage);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, []);
 
   // Load stats when switching to stats tab
@@ -289,6 +345,20 @@ function AdminDashboard() {
           Logout
         </button>
       </div>
+
+      {/* ── NOTIFICATION BANNER ── */}
+      {notifStatus !== "granted" && (
+        <div style={S.notifBanner}>
+          {notifStatus === "denied"
+            ? "⚠️ Notifications blocked. Go to browser Site Settings → Notifications → Allow for this site."
+            : "🔔 Enable notifications to get alerted when new orders arrive on this device."}
+          {notifStatus !== "denied" && (
+            <button style={S.notifBtn} onClick={setupNotifications}>
+              Enable Notifications
+            </button>
+          )}
+        </div>
+      )}
 
       {/* ══════════════ ORDERS TAB ══════════════ */}
       {tab === "orders" &&
@@ -669,6 +739,27 @@ const S = {
     fontSize: "12px",
     fontWeight: "500",
     marginLeft: "auto",
+  },
+  notifBanner: {
+    background: "#FFF3CD",
+    borderBottom: "1px solid #FFE082",
+    padding: "10px 16px",
+    fontSize: "13px",
+    color: "#7B5800",
+    display: "flex",
+    alignItems: "center",
+    gap: "12px",
+    flexWrap: "wrap",
+  },
+  notifBtn: {
+    background: "#F57C00",
+    color: "#FFF",
+    border: "none",
+    padding: "6px 14px",
+    borderRadius: "4px",
+    cursor: "pointer",
+    fontSize: "12px",
+    fontWeight: "600",
   },
   wrap: { maxWidth: "1400px", margin: "0 auto", padding: "20px 16px", boxSizing: "border-box" },
   loader: { textAlign: "center", padding: "80px", color: "#9C9C9C", fontSize: "15px" },
