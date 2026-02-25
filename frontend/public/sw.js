@@ -1,20 +1,24 @@
 // sw.js — place this in your /public folder
 
 const API = "https://five0-50-chinese-fast-food-6.onrender.com";
-const POLL_INTERVAL = 10000; // 10 seconds
+const POLL_INTERVAL = 8000; // 8 seconds
+const PING_INTERVAL = 8000; // ping page every 8s so it re-fetches even if its own timer died
+
 let pollTimer = null;
+let pingTimer = null;
 let knownOrderIds = null;
 let adminToken = null;
 
-// ── Receive token from the page ──
+// ── Receive messages from the page ──
 self.addEventListener("message", (event) => {
   if (event.data?.type === "INIT") {
     adminToken = event.data.token;
     knownOrderIds = event.data.knownIds ? new Set(event.data.knownIds) : null;
     startPolling();
+    startPinging();
   }
   if (event.data?.type === "STOP") {
-    stopPolling();
+    stopAll();
   }
   if (event.data?.type === "UPDATE_IDS") {
     knownOrderIds = new Set(event.data.knownIds);
@@ -22,16 +26,27 @@ self.addEventListener("message", (event) => {
 });
 
 function startPolling() {
-  stopPolling(); // clear any existing timer
-  poll(); // run immediately
+  if (pollTimer) clearInterval(pollTimer);
+  poll();
   pollTimer = setInterval(poll, POLL_INTERVAL);
 }
 
-function stopPolling() {
-  if (pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = null;
-  }
+// Ping the page on a timer so it re-fetches data even if its own setInterval died
+function startPinging() {
+  if (pingTimer) clearInterval(pingTimer);
+  pingTimer = setInterval(async () => {
+    const clients = await self.clients.matchAll({ type: "window" });
+    for (const client of clients) {
+      client.postMessage({ type: "PING" });
+    }
+  }, PING_INTERVAL);
+}
+
+function stopAll() {
+  clearInterval(pollTimer);
+  clearInterval(pingTimer);
+  pollTimer = null;
+  pingTimer = null;
 }
 
 async function poll() {
@@ -39,6 +54,7 @@ async function poll() {
   try {
     const res = await fetch(`${API}/orders`, {
       headers: { Authorization: "Bearer " + adminToken },
+      cache: "no-store",
     });
     if (!res.ok) return;
     const orders = await res.json();
@@ -48,8 +64,12 @@ async function poll() {
     );
 
     if (knownOrderIds === null) {
-      // First poll — just set baseline, don't notify
       knownOrderIds = currentPendingIds;
+      // Still ping page to refresh on first load
+      const clients = await self.clients.matchAll({ type: "window" });
+      for (const client of clients) {
+        client.postMessage({ type: "PING" });
+      }
       return;
     }
 
@@ -57,10 +77,16 @@ async function poll() {
       (o) => o.status !== "paid" && !knownOrderIds.has(String(o.id))
     );
 
-    if (newOrders.length > 0) {
-      knownOrderIds = currentPendingIds;
+    knownOrderIds = currentPendingIds;
 
-      // Notify for each new order
+    // Always ping the page so it stays in sync
+    const clients = await self.clients.matchAll({ type: "window" });
+    for (const client of clients) {
+      client.postMessage({ type: "PING" });
+    }
+
+    if (newOrders.length > 0) {
+      // Send notification for each new order
       for (const order of newOrders) {
         await self.registration.showNotification("🚨 New Order Received!", {
           body: `Table ${order.table_id} — ${order.customer_name} — ₹${order.total}`,
@@ -68,25 +94,22 @@ async function poll() {
           badge: "/logo.png",
           tag: `order-${order.id}`,
           requireInteraction: true,
-          vibrate: [200, 100, 200, 100, 200],
+          vibrate: [300, 100, 300, 100, 300],
           data: { url: self.location.origin + "/admin" },
         });
       }
 
-      // Tell the page to refresh if it's open
-      const clients = await self.clients.matchAll({ type: "window" });
+      // Tell page specifically a new order arrived
       for (const client of clients) {
         client.postMessage({ type: "NEW_ORDER" });
       }
-    } else {
-      knownOrderIds = currentPendingIds;
     }
   } catch (e) {
     console.error("[SW] poll error:", e);
   }
 }
 
-// ── Open the app when notification is clicked ──
+// ── Open the app when notification is tapped ──
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const url = event.notification.data?.url || self.location.origin;
