@@ -4,40 +4,14 @@ import { useNavigate } from "react-router-dom";
 const API = "https://five0-50-chinese-fast-food-6.onrender.com";
 const POLL_INTERVAL = 5000;
 
-function playBeep() {
-  try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-
-    const resume = ctx.state === "suspended" ? ctx.resume() : Promise.resolve();
-
-    resume.then(() => {
-      const masterGain = ctx.createGain();
-      masterGain.gain.setValueAtTime(1.0, ctx.currentTime);
-      masterGain.connect(ctx.destination);
-
-      [0, 0.22, 0.44].forEach((offset) => {
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-
-        osc.connect(gain);
-        gain.connect(masterGain);
-
-        osc.type = "square";
-        osc.frequency.setValueAtTime(880, ctx.currentTime + offset);
-        osc.frequency.setValueAtTime(1100, ctx.currentTime + offset + 0.05);
-
-        gain.gain.setValueAtTime(0, ctx.currentTime + offset);
-        gain.gain.linearRampToValueAtTime(1.0, ctx.currentTime + offset + 0.01);
-        gain.gain.setValueAtTime(1.0, ctx.currentTime + offset + 0.1);
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + offset + 0.18);
-
-        osc.start(ctx.currentTime + offset);
-        osc.stop(ctx.currentTime + offset + 0.2);
-      });
-
-      setTimeout(() => ctx.close(), 1500);
+function notifyNewOrder() {
+  if (Notification.permission === "granted") {
+    new Notification("🚨 New Order!", {
+      body: "A new order just came in!",
+      icon: "/logo.png",
+      requireInteraction: true, // stays on screen until dismissed
     });
-  } catch (_) {}
+  }
 }
 
 // ── Month options for CSV picker ──
@@ -124,13 +98,7 @@ function AdminDashboard() {
         const currentIds = new Set(oData.filter(o => o.status !== "paid").map(o => o.id));
         const hasNew = [...currentIds].some(id => !prevPendingIds.current.has(id));
         if (hasNew) {
-          playBeep();
-          if (Notification.permission === "granted") {
-            new Notification("🚨 New Order!", {
-              body: "A new order just came in!",
-              icon: "/logo.png",
-            });
-          }
+          notifyNewOrder();
           setItemStatus(prev => {
             const next = { ...prev };
             oData
