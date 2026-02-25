@@ -249,4 +249,4 @@ self.addEventListener("notificationclick", (event) => {
 // Lifecycle — take control immediately
 // ──────────────────────────────────────────────
 self.addEventListener("install",  (e) => e.waitUntil(self.skipWaiting()));
-self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));v
+self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
