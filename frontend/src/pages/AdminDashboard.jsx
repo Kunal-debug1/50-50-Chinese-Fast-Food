@@ -167,7 +167,7 @@ export default function AdminDashboard() {
       });
 
       setTables(tData);
-      setOrders(oData);
+      setOrders(oData.map(o => ({ ...o, id: o._id })));;
       setIncome(iData.total_income ?? 0);
     } catch (e) {
       console.error("fetchAll:", e);
