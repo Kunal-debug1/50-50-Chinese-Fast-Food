@@ -140,9 +140,7 @@ app.config.update(
 # ── Extension init ────────────────────────────────────────────────────────────
 Compress(app)
 
-# FIX 1: CORS must include origins + supports_credentials so Vercel requests
-#         are not blocked by the browser's CORS preflight check.
-CORS(app, resources={r"/*": {"origins": FRONTEND_URL}}, supports_credentials=True)
+CORS(app)
 
 jwt   = JWTManager(app)
 cache = Cache(app)
