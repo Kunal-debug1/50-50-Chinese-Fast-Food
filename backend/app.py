@@ -448,8 +448,19 @@ def create_order():
 
     table_id = _coerce_table_id(data.get("table_id")) if data.get("table_id") else None
 
+    # ⭐ Fetch table number
+    table_number = None
+    if table_id is not None:
+        table_doc = get_collection("tables").find_one(
+            _build_table_filter(table_id),
+            {"number": 1}
+        )
+        if table_doc:
+            table_number = table_doc.get("number")
+
     doc = {
         "table_id":      table_id,
+        "table_number":  table_number,
         "items":         items,
         "total":         total,
         "status":        "pending",
@@ -470,6 +481,7 @@ def create_order():
 
     cache.clear()
     emit_event("new_order", {"message": "New order received", "order_id": order_id})
+
     return jsonify(message="Order created successfully", order_id=order_id), 201
 
 
