@@ -59,7 +59,7 @@ import time
 import logging
 import logging.config
 from datetime import datetime, timezone, timedelta
-import init_db
+
 # ── Third-party ───────────────────────────────────────────────────────────────
 import requests as http_requests
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -147,15 +147,12 @@ cache = Cache(app)
 
 socketio = SocketIO(
     app,
-    cors_allowed_origins = FRONTEND_URL,
-    async_mode           = "eventlet",
-    ping_timeout         = 20,
-    # FIX 2: removed stray "s" after ping_interval value that caused SyntaxError
-    ping_interval        = 10,
-    # Multi-worker Socket.IO (uncomment + set REDIS_URL):
-    # message_queue      = os.getenv("REDIS_URL"),
-    logger               = False,
-    engineio_logger      = False,
+    cors_allowed_origins="*",
+    async_mode="eventlet",
+    ping_timeout=30,
+    ping_interval=15,
+    logger=False,
+    engineio_logger=False,
 )
 
 # ── DB startup ────────────────────────────────────────────────────────────────
@@ -164,7 +161,7 @@ initialize_database()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-#                    KEEP-ALIVE SCHEDULER  (anti cold-start)
+#                    KEEP-ALIVE SCHEULER  (anti col-start)
 # ════════════════════════════════════════════════════════════════════════════════
 
 def _keep_alive() -> None:
@@ -415,7 +412,7 @@ def update_table_status(table_id):
     if result.matched_count == 0:
         return jsonify(error="Table not found"), 404
 
-    _bust(_CACHE_TABLES)
+    cache.clear()
     emit_event("table_updated", {"table_id": table_id})
     return jsonify(message="Table status updated")
 
@@ -471,15 +468,13 @@ def create_order():
             {"$set": {"status": "reserved"}},
         )
 
-    _bust(_CACHE_TABLES, _CACHE_ORDERS, _CACHE_FINANCE)
+    cache.clear()
     emit_event("new_order", {"message": "New order received", "order_id": order_id})
     return jsonify(message="Order created successfully", order_id=order_id), 201
 
 
 @orders_bp.get("")
 @jwt_required()
-# FIX 3: added key_prefix="all_orders" — without it @cache.cached has no stable
-#         key, so the cache never hits and every admin request hits MongoDB.
 @cache.cached(timeout=10, key_prefix="all_orders")
 def get_orders():
     docs = get_collection("orders").find({}, _PROJ_ORDER_LIST).sort("created_at", -1)
@@ -549,13 +544,9 @@ def update_order_status(order_id):
     if result.matched_count == 0:
         return jsonify(error="Order not found"), 404
 
-    _bust(_CACHE_ORDERS)
+    cache.clear()
     emit_event("order_updated", {"order_id": order_id})
     return jsonify(message="Status updated")
-
-# FIX 4: removed two stray cache.clear() calls that were sitting outside any
-#         function — they were executing at module import time and wiping the
-#         entire cache whenever the file was loaded or a worker forked.
 
 
 @orders_bp.put("/<order_id>/pay")
@@ -581,7 +572,7 @@ def mark_paid(order_id):
             {"$set": {"status": "free"}},
         )
 
-    _bust(_CACHE_TABLES, _CACHE_ORDERS, _CACHE_FINANCE)
+    cache.clear()
     emit_event("order_updated", {"order_id": order_id})
     if table_id is not None:
         emit_event("table_updated", {"table_id": str(table_id)})
@@ -642,7 +633,7 @@ def stats_daily():
     ]
     rows = []
     for doc in get_collection("orders").aggregate(pipeline):
-        d = doc["id"]
+        d = doc["_id"]
         rows.append({
             "date":            f"{d['year']:04d}-{d['month']:02d}-{d['day']:02d}",
             "total_orders":    doc["total_orders"],
@@ -673,7 +664,7 @@ def stats_monthly():
     ]
     rows = []
     for doc in get_collection("orders").aggregate(pipeline):
-        d = doc["id"]
+        d = doc["_id"]
         rows.append({
             "year":            d["year"],
             "month":           d["month"],
@@ -742,7 +733,7 @@ def monthly_csv():
             date_str, time_str = s[:10], s[11:16]
 
         writer.writerow([
-            str(doc["id"]), date_str, time_str,
+            str(doc["_id"]), date_str, time_str,
             f"Table {doc.get('table_id', '-')}",
             doc.get("customer_name", ""),
             doc.get("whatsapp", ""),
