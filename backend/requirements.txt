@@ -1,11 +1,19 @@
+# ── Web framework ─────────────────────────────────────────────────────────────
 Flask==3.0.3
 flask-cors==4.0.1
 flask-jwt-extended==4.6.0
 flask-socketio==5.3.6
 flask-limiter==3.6.0
 flask-caching==2.3.0
-apscheduler==3.10.4
 Werkzeug==3.0.3
+
+# ── ASGI / async ──────────────────────────────────────────────────────────────
 gunicorn==22.0.0
-psycopg2-binary==2.9.9
 eventlet==0.36.1
+
+# ── MongoDB ───────────────────────────────────────────────────────────────────
+pymongo[srv]==4.7.3        # [srv] pulls in dnspython for mongodb+srv:// URIs
+dnspython==2.6.1           # explicit pin — required for Atlas SRV DNS lookups
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+apscheduler==3.10.4
