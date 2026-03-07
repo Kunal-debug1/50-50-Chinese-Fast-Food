@@ -7,13 +7,14 @@ flask-limiter==3.6.0
 flask-caching==2.3.0
 Werkzeug==3.0.3
 
-# ── ASGI / async ──────────────────────────────────────────────────────────────
+# ── ASGI / concurrency ────────────────────────────────────────────────────────
 gunicorn==22.0.0
 eventlet==0.36.1
 
 # ── MongoDB ───────────────────────────────────────────────────────────────────
-pymongo[srv]==4.7.3        # [srv] pulls in dnspython for mongodb+srv:// URIs
-dnspython==2.6.1           # explicit pin — required for Atlas SRV DNS lookups
+pymongo[srv]==4.7.3   # [srv] includes dnspython for mongodb+srv:// Atlas URIs
+dnspython==2.6.1      # explicit pin — SRV DNS resolution for Atlas
 
-# ── Scheduler ─────────────────────────────────────────────────────────────────
+# ── Scheduler + HTTP (keep-alive ping) ───────────────────────────────────────
 apscheduler==3.10.4
+requests==2.32.3
