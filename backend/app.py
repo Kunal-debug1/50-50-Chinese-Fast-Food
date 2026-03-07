@@ -644,7 +644,7 @@ def stats_daily():
     ]
     rows = []
     for doc in get_collection("orders").aggregate(pipeline):
-        d = doc["_id"]
+        d = doc["id"]
         rows.append({
             "date":            f"{d['year']:04d}-{d['month']:02d}-{d['day']:02d}",
             "total_orders":    doc["total_orders"],
@@ -675,7 +675,7 @@ def stats_monthly():
     ]
     rows = []
     for doc in get_collection("orders").aggregate(pipeline):
-        d = doc["_id"]
+        d = doc["id"]
         rows.append({
             "year":            d["year"],
             "month":           d["month"],
@@ -744,7 +744,7 @@ def monthly_csv():
             date_str, time_str = s[:10], s[11:16]
 
         writer.writerow([
-            str(doc["_id"]), date_str, time_str,
+            str(doc["id"]), date_str, time_str,
             f"Table {doc.get('table_id', '-')}",
             doc.get("customer_name", ""),
             doc.get("whatsapp", ""),
