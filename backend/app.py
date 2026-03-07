@@ -64,6 +64,7 @@ import time
 import logging
 import logging.config
 from datetime import datetime, timezone, timedelta
+import init_db
 
 # ── Third-party ───────────────────────────────────────────────────────────────
 import requests as http_requests
