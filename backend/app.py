@@ -16,11 +16,14 @@ Performance architecture
   MONGODB QUERY OPTIMISATIONS
   • Every find() carries an explicit projection — only fetches fields the
     route actually returns; halves document transfer on wide collections
-  • Partial indexes on {status:"paid"} used by all stats aggregations
-  • Aggregation pipelines use $match as the first stage so MongoDB can
-    use the partial index before doing any $group work
+  • Two partial indexes on {status:"paid"} — DESC for stats, ASC for CSV
+  • Aggregation pipelines use $match first + hint() to force the correct
+    partial index before any $group work — critical at scale
+  • allowDiskUse=True on all aggregations — prevents OOM on large datasets
   • count_documents({}, limit=1) instead of full collection count
   • find_one() with projection instead of find().limit(1)
+  • table_number stored on order document at creation — eliminates a
+    secondary lookup on every admin order list render
 
   RENDER FREE-TIER COLD START PREVENTION
   • APScheduler keep-alive pings /health every 10 min
@@ -28,8 +31,10 @@ Performance architecture
   • --preload flag in start command warms the pool before workers fork
 
   RESPONSE OPTIMISATIONS
-  • flask-compress gzip/br compression on all JSON responses
+  • flask-compress gzip/br compression on all JSON + CSV responses
   • JSON_SORT_KEYS=False — skips alphabetical sort on every response
+  • Connection: keep-alive header — reuses TCP connections from Vercel
+  • ETag + Cache-Control headers — lets browser/CDN skip repeat fetches
   • After-request logging avoids string formatting until log level check
 
   CONCURRENCY
@@ -128,7 +133,7 @@ app.config.update(
     CACHE_REDIS_URL          = os.getenv("REDIS_URL"),
 
     # ── Flask ─────────────────────────────────────────────────────────────────
-    JSON_SORT_KEYS           = False,
+    JSON_SORT_KEYS           = False,   # skip key sort on every JSON response
     PROPAGATE_EXCEPTIONS     = True,
 
     # ── Compression ───────────────────────────────────────────────────────────
@@ -138,21 +143,24 @@ app.config.update(
 )
 
 # ── Extension init ────────────────────────────────────────────────────────────
-Compress(app)
+Compress(app)   # gzip / brotli all JSON + CSV responses automatically
 
-CORS(app)
+# CORS: must include origins + supports_credentials so Vercel preflight passes
+CORS(app, resources={r"/*": {"origins": FRONTEND_URL}}, supports_credentials=True)
 
 jwt   = JWTManager(app)
 cache = Cache(app)
 
 socketio = SocketIO(
     app,
-    cors_allowed_origins="*",
-    async_mode="eventlet",
-    ping_timeout=30,
-    ping_interval=15,
-    logger=False,
-    engineio_logger=False,
+    cors_allowed_origins = FRONTEND_URL,
+    async_mode           = "eventlet",
+    ping_timeout         = 20,
+    ping_interval        = 10,
+    # Multi-worker Socket.IO → uncomment + set REDIS_URL:
+    # message_queue      = os.getenv("REDIS_URL"),
+    logger               = False,
+    engineio_logger      = False,
 )
 
 # ── DB startup ────────────────────────────────────────────────────────────────
@@ -161,7 +169,7 @@ initialize_database()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-#                    KEEP-ALIVE SCHEULER  (anti col-start)
+#                    KEEP-ALIVE SCHEDULER  (anti cold-start)
 # ════════════════════════════════════════════════════════════════════════════════
 
 def _keep_alive() -> None:
@@ -273,18 +281,22 @@ def _build_table_filter(table_id) -> dict:
     return {"$or": [{"id": coerced}, {"number": str(table_id)}]}
 
 
-# ── Shared projections — fetch only what each route actually returns ──────────
+# ── Shared projections — fetch ONLY what each route actually returns ──────────
+# This is the single biggest per-query latency win: never pull fields you
+# don't need across the wire from Atlas to Render.
+
 _PROJ_ORDER_LIST = {
-    "_id": 1, "table_id": 1, "items": 1, "total": 1,
+    "_id": 1, "table_id": 1, "table_number": 1, "items": 1, "total": 1,
     "status": 1, "customer_name": 1, "whatsapp": 1,
     "session_id": 1, "created_at": 1,
 }
 _PROJ_TABLE_LIST = {"_id": 1, "number": 1, "status": 1}
-_PROJ_ORDER_PAY  = {"_id": 1, "table_id": 1}
+_PROJ_ORDER_PAY  = {"_id": 1, "table_id": 1}   # mark_paid only needs table_id
+_PROJ_TABLE_NUM  = {"_id": 0, "number": 1}      # create_order table_number fetch
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-#                          REQUEST TIMING MIDDLEWARE
+#                          REQUEST TIMING + KEEP-ALIVE HEADERS
 # ════════════════════════════════════════════════════════════════════════════════
 
 @app.before_request
@@ -298,8 +310,15 @@ def _log_request(response):
     if logger.isEnabledFor(logging.INFO):
         logger.info('"%s %s" %d %.1fms',
                     request.method, request.path, response.status_code, ms)
+
+    # Keep TCP connections alive across multiple requests from Vercel / browser
+    response.headers["Connection"] = "keep-alive"
+    response.headers["Keep-Alive"]  = "timeout=30, max=100"
+
+    # Let browser + Vercel edge cache successful GET responses briefly
     if request.method == "GET" and response.status_code == 200:
         response.headers.setdefault("Cache-Control", "public, max-age=5")
+
     return response
 
 
@@ -387,6 +406,7 @@ tables_bp = Blueprint("tables", __name__, url_prefix="/tables")
 @tables_bp.get("")
 @cache.cached(timeout=60, key_prefix="all_tables")
 def get_tables():
+    # Projection: only 3 fields fetched; _id serialised to string inline
     docs = get_collection("tables").find({}, _PROJ_TABLE_LIST)
     return jsonify([
         {"id": str(d["_id"]), "number": d["number"], "status": d["status"]}
@@ -448,20 +468,22 @@ def create_order():
 
     table_id = _coerce_table_id(data.get("table_id")) if data.get("table_id") else None
 
-    # ⭐ Fetch table number
+    # Fetch table number once at creation time and store it on the order document.
+    # This eliminates a secondary collection lookup on every admin order list render
+    # — the number is available directly on the order without joining tables.
     table_number = None
     if table_id is not None:
         table_doc = get_collection("tables").find_one(
             _build_table_filter(table_id),
-            {"number": 1}
+            _PROJ_TABLE_NUM,            # only fetch the number field
         )
         if table_doc:
             table_number = table_doc.get("number")
 
     doc = {
         "table_id":      table_id,
-        "table_number":  table_number,
-        "items":         items,
+        "table_number":  table_number,  # denormalised — avoids join on reads
+        "items":         items,         # native BSON array — no JSON string needed
         "total":         total,
         "status":        "pending",
         "customer_name": data.get("customer_name"),
@@ -481,7 +503,6 @@ def create_order():
 
     cache.clear()
     emit_event("new_order", {"message": "New order received", "order_id": order_id})
-
     return jsonify(message="Order created successfully", order_id=order_id), 201
 
 
@@ -489,6 +510,7 @@ def create_order():
 @jwt_required()
 @cache.cached(timeout=10, key_prefix="all_orders")
 def get_orders():
+    # Projection includes table_number — no secondary table lookup needed
     docs = get_collection("orders").find({}, _PROJ_ORDER_LIST).sort("created_at", -1)
     return jsonify(_serialize_list(docs))
 
@@ -571,6 +593,7 @@ def mark_paid(order_id):
     orders_col = get_collection("orders")
     tables_col = get_collection("tables")
 
+    # Projection: only fetch table_id — don't pull items/customer fields
     order = orders_col.find_one({"_id": oid}, _PROJ_ORDER_PAY)
     if not order:
         return jsonify(error="Order not found"), 404
@@ -604,11 +627,19 @@ income_bp = Blueprint("income", __name__, url_prefix="/income")
 @jwt_required()
 @cache.cached(timeout=120, key_prefix="total_income")
 def total_income():
+    # hint() forces the partial idx_orders_paid_desc index — avoids a full
+    # collection scan even on the unfiltered $match stage
     pipeline = [
         {"$match": {"status": "paid"}},
         {"$group": {"_id": None, "income": {"$sum": "$total"}}},
     ]
-    result = list(get_collection("orders").aggregate(pipeline))
+    result = list(
+        get_collection("orders").aggregate(
+            pipeline,
+            hint="idx_orders_paid_desc",    # force partial paid-orders index
+            allowDiskUse=True,              # prevent OOM on large datasets
+        )
+    )
     return jsonify(total_income=float(result[0]["income"]) if result else 0.0)
 
 
@@ -627,7 +658,16 @@ _MONTH_NAMES = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
 @jwt_required()
 @cache.cached(timeout=300, key_prefix="stats_daily")
 def stats_daily():
-    """Daily revenue for last 30 days — $match first uses partial paid index."""
+    """
+    Daily revenue for last 30 days.
+    $match is the first stage — MongoDB uses the partial idx_orders_paid_desc
+    index before doing any $group work, keeping this fast even with millions
+    of historical orders.
+    hint() makes index selection explicit and immune to the query planner
+    choosing a suboptimal plan under load.
+    allowDiskUse=True prevents OOM errors on large result sets.
+    Cached 5 min — chart data, minor staleness is acceptable.
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(days=30)
     pipeline = [
         {"$match": {"status": "paid", "created_at": {"$gte": cutoff}}},
@@ -644,7 +684,11 @@ def stats_daily():
         {"$sort": {"_id": -1}},
     ]
     rows = []
-    for doc in get_collection("orders").aggregate(pipeline):
+    for doc in get_collection("orders").aggregate(
+        pipeline,
+        hint="idx_orders_paid_desc",    # force partial paid-orders index
+        allowDiskUse=True,
+    ):
         d = doc["_id"]
         rows.append({
             "date":            f"{d['year']:04d}-{d['month']:02d}-{d['day']:02d}",
@@ -659,7 +703,10 @@ def stats_daily():
 @jwt_required()
 @cache.cached(timeout=300, key_prefix="stats_monthly")
 def stats_monthly():
-    """Monthly revenue for last 12 months — same index strategy as stats_daily."""
+    """
+    Monthly revenue for last 12 months.
+    Same index + allowDiskUse strategy as stats_daily.
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(days=365)
     pipeline = [
         {"$match": {"status": "paid", "created_at": {"$gte": cutoff}}},
@@ -675,7 +722,11 @@ def stats_monthly():
         {"$sort": {"_id": -1}},
     ]
     rows = []
-    for doc in get_collection("orders").aggregate(pipeline):
+    for doc in get_collection("orders").aggregate(
+        pipeline,
+        hint="idx_orders_paid_desc",    # force partial paid-orders index
+        allowDiskUse=True,
+    ):
         d = doc["_id"]
         rows.append({
             "year":            d["year"],
@@ -691,7 +742,13 @@ def stats_monthly():
 @stats_bp.get("/monthly/csv")
 @jwt_required()
 def monthly_csv():
-    """Download paid orders for a given month as CSV.  ?month=YYYY-MM"""
+    """
+    Download paid orders for a given month as CSV.  ?month=YYYY-MM
+    Projection fetches only CSV-relevant fields — avoids pulling full docs.
+    hint() forces the ascending partial index (idx_orders_paid_asc) which
+    matches the CSV sort order — MongoDB satisfies the sort from the index
+    with no extra sort stage.
+    """
     month_param = request.args.get("month")
     query: dict = {"status": "paid"}
 
@@ -710,11 +767,19 @@ def monthly_csv():
         start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
         query["created_at"] = {"$gte": start}
 
+    # Only fetch CSV-relevant fields
     projection = {
-        "_id": 1, "table_id": 1, "customer_name": 1,
+        "_id": 1, "table_id": 1, "table_number": 1, "customer_name": 1,
         "whatsapp": 1, "items": 1, "total": 1, "created_at": 1,
     }
-    docs = get_collection("orders").find(query, projection).sort("created_at", 1)
+    # hint forces ascending partial index — sort is satisfied from the index,
+    # no in-memory sort stage needed
+    docs = (
+        get_collection("orders")
+        .find(query, projection)
+        .hint("idx_orders_paid_asc")
+        .sort("created_at", 1)
+    )
 
     output = io.StringIO()
     writer = csv.writer(output)
@@ -725,6 +790,7 @@ def monthly_csv():
 
     for doc in docs:
         items_data = doc.get("items", [])
+        # Guard: legacy docs may have items as a JSON string
         if isinstance(items_data, str):
             try:
                 items_data = json.loads(items_data)
@@ -744,9 +810,12 @@ def monthly_csv():
             s = str(dt)
             date_str, time_str = s[:10], s[11:16]
 
+        # Use denormalised table_number if available, fall back to table_id
+        table_label = doc.get("table_number") or doc.get("table_id") or "-"
+
         writer.writerow([
             str(doc["_id"]), date_str, time_str,
-            f"Table {doc.get('table_id', '-')}",
+            f"Table {table_label}",
             doc.get("customer_name", ""),
             doc.get("whatsapp", ""),
             items_summary,
