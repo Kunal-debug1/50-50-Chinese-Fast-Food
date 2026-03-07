@@ -1,134 +1,99 @@
 """
-database.py — Production-grade PostgreSQL connection pool
+database.py — Production-grade MongoDB Atlas connection
 =========================================================
-• ThreadedConnectionPool with configurable min/max from env
-• TCP keepalives to prevent stale connections on Render
-• Graceful degradation: pool exhaustion → clear error, not crash
-• Context-manager helper for safe acquire/release
+• MongoClient with connection pooling (configurable via env)
+• TCP keepalives and server-selection timeout for Render deployments
+• Graceful degradation: connection failure → clear error, not crash
+• Simple module-level helpers mirroring the old db_conn() interface
 """
 
 import os
 import logging
-from contextlib import contextmanager
 
-import psycopg2
-import psycopg2.extras
-from psycopg2 import pool as pg_pool
-from psycopg2 import OperationalError
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 
 logger = logging.getLogger(__name__)
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL environment variable is not set")
+# ── Environment ───────────────────────────────────────────────────────────────
+MONGO_URI = os.getenv("MONGO_URI")
+if not MONGO_URI:
+    raise RuntimeError("MONGO_URI environment variable is not set")
 
-# ── Pool configuration (tunable via env) ──────────────────────────────────────
-_MIN_CONN = int(os.getenv("DB_POOL_MIN", 2))
-_MAX_CONN = int(os.getenv("DB_POOL_MAX", 15))
+DB_NAME = os.getenv("MONGO_DB_NAME", "restaurant_db")
 
-_pool: pg_pool.ThreadedConnectionPool | None = None
+# ── Pool configuration (tunable via env) ─────────────────────────────────────
+_MAX_POOL   = int(os.getenv("MONGO_POOL_MAX", 50))   # connections per host
+_MIN_POOL   = int(os.getenv("MONGO_POOL_MIN", 5))
+_CONN_MS    = int(os.getenv("MONGO_CONNECT_TIMEOUT_MS",  5_000))   # 5 s
+_SERVER_MS  = int(os.getenv("MONGO_SERVER_TIMEOUT_MS",  10_000))   # 10 s
+_SOCKET_MS  = int(os.getenv("MONGO_SOCKET_TIMEOUT_MS",  30_000))   # 30 s
+
+_client: MongoClient | None = None
 
 
-def _create_pool() -> pg_pool.ThreadedConnectionPool:
-    """Create a new connection pool with TCP keepalives."""
-    return pg_pool.ThreadedConnectionPool(
-        minconn=_MIN_CONN,
-        maxconn=_MAX_CONN,
-        dsn=DATABASE_URL,
-        # TCP keepalives — essential on Render to avoid silent drops
-        keepalives=1,
-        keepalives_idle=30,
-        keepalives_interval=10,
-        keepalives_count=5,
+# ════════════════════════════════════════════════════════════════════════════════
+#                              INITIALISATION
+# ════════════════════════════════════════════════════════════════════════════════
+
+def init_mongo() -> None:
+    """
+    Create the global MongoClient.  Call once at app startup.
+    Uses a single client instance — MongoClient is thread-safe and manages its
+    own internal connection pool, so one instance is the recommended pattern.
+    """
+    global _client
+    _client = MongoClient(
+        MONGO_URI,
+        maxPoolSize=_MAX_POOL,
+        minPoolSize=_MIN_POOL,
+        connectTimeoutMS=_CONN_MS,
+        serverSelectionTimeoutMS=_SERVER_MS,
+        socketTimeoutMS=_SOCKET_MS,
+        # Retryable writes protect against transient network hiccups
+        retryWrites=True,
+        # Use majority write concern for durability
+        w="majority",
+        # Atlas requires TLS; the srv+mongodb scheme enables it automatically.
+        # If using a plain mongodb:// URI on Atlas, uncomment the next line:
+        # tls=True,
+    )
+    logger.info(
+        "MongoDB client created — pool min=%d max=%d", _MIN_POOL, _MAX_POOL
     )
 
 
-def init_pool() -> None:
-    """Initialise the global pool.  Call once at app startup."""
-    global _pool
-    _pool = _create_pool()
-    logger.info("PostgreSQL connection pool created (min=%d, max=%d)", _MIN_CONN, _MAX_CONN)
+# ════════════════════════════════════════════════════════════════════════════════
+#                              PUBLIC HELPERS
+# ════════════════════════════════════════════════════════════════════════════════
+
+def get_client() -> MongoClient:
+    """Return the global MongoClient, initialising it lazily if needed."""
+    global _client
+    if _client is None:
+        init_mongo()
+    return _client  # type: ignore[return-value]
 
 
-def get_connection() -> psycopg2.extensions.connection:
+def get_db():
+    """Return the restaurant_db Database object."""
+    return get_client()[DB_NAME]
+
+
+def get_collection(name: str):
+    """Shortcut to get a named collection from restaurant_db."""
+    return get_db()[name]
+
+
+def ping_db() -> bool:
     """
-    Acquire a connection from the pool.
-    Automatically sets RealDictCursor as the default cursor factory.
-    Raises RuntimeError if the pool is exhausted.
+    Check whether the server is reachable.
+    Returns True on success, False on failure.
+    Used by the /health endpoint.
     """
-    global _pool
-    if _pool is None:
-        init_pool()
     try:
-        conn = _pool.getconn()
-        conn.cursor_factory = psycopg2.extras.RealDictCursor
-        return conn
-    except pg_pool.PoolError as exc:
-        logger.error("Connection pool exhausted: %s", exc)
-        raise RuntimeError("Database connection pool exhausted — try again shortly") from exc
-
-
-def release_connection(conn: psycopg2.extensions.connection, *, error: bool = False) -> None:
-    """
-    Return a connection to the pool.
-    Pass error=True to discard a broken connection instead of recycling it.
-    """
-    global _pool
-    if _pool is None:
-        return
-    try:
-        if error:
-            # Force-close so the pool doesn't recycle a broken socket
-            try:
-                conn.close()
-            except Exception:
-                pass
-            _pool.putconn(conn, close=True)
-        else:
-            _pool.putconn(conn)
-    except Exception as exc:
-        logger.warning("Failed to release connection: %s", exc)
-
-
-@contextmanager
-def db_conn(autocommit: bool = False):
-    """
-    Context manager for safe connection use.
-
-    Usage (read-only, no explicit commit needed):
-        with db_conn() as cur:
-            cur.execute("SELECT ...")
-            rows = cur.fetchall()
-
-    Usage (write, commits automatically on success):
-        with db_conn() as cur:
-            cur.execute("INSERT ...")
-        # committed here
-
-    On exception: rolls back and re-raises.
-    """
-    conn = get_connection()
-    broken = False
-    try:
-        if autocommit:
-            conn.set_session(autocommit=True)
-        cur = conn.cursor()
-        yield cur
-        if not autocommit:
-            conn.commit()
-    except OperationalError as exc:
-        broken = True
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        logger.error("DB operational error: %s", exc)
-        raise
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        raise
-    finally:
-        release_connection(conn, error=broken)
+        get_client().admin.command("ping")
+        return True
+    except (ConnectionFailure, ServerSelectionTimeoutError) as exc:
+        logger.error("MongoDB ping failed: %s", exc)
+        return False
