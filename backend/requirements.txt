@@ -12,8 +12,8 @@ gunicorn==22.0.0
 eventlet==0.36.1
 
 # ── MongoDB ───────────────────────────────────────────────────────────────────
-pymongo[srv]==4.7.3   # [srv] includes dnspython for mongodb+srv:// Atlas URIs
-dnspython==2.6.1      # explicit pin — SRV DNS resolution for Atlas
+pymongo[srv]==4.7.3
+# dnspython included automatically via pymongo[srv]
 
 # ── Scheduler + HTTP (keep-alive ping) ───────────────────────────────────────
 apscheduler==3.10.4
