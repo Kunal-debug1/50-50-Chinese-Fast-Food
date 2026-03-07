@@ -34,18 +34,32 @@ function TableSelection() {
 
   /* ================= REAL-TIME SOCKET ================= */
   useEffect(() => {
-    const socket = io("https://five0-50-chinese-fast-food-6.onrender.com");
+  const socket = io("https://five0-50-chinese-fast-food-6.onrender.com", {
+    transports: ["polling", "websocket"],   // allow fallback
+    upgrade: true,
+    reconnection: true,
+    reconnectionAttempts: 5,
+    reconnectionDelay: 1000,
+  });
 
-    socket.on("table_updated", stableFetch);
-    socket.on("new_order", stableFetch);
+  socket.on("connect", () => {
+    console.log("Socket connected:", socket.id);
+  });
 
-    return () => {
-      socket.off("table_updated", stableFetch);
-      socket.off("new_order", stableFetch);
-      socket.disconnect();
-    };
-  }, [stableFetch]);
+  socket.on("table_updated", stableFetch);
+  socket.on("new_order", stableFetch);
 
+  socket.on("disconnect", () => {
+    console.log("Socket disconnected");
+  });
+
+  return () => {
+    socket.off("table_updated", stableFetch);
+    socket.off("new_order", stableFetch);
+    socket.disconnect();
+  };
+}, [stableFetch]);
+  
   /* ================= HANDLE TABLE SELECT ================= */
   const handleSelect = useCallback(
     (table) => {
