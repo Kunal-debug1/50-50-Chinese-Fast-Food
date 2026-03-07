@@ -5,18 +5,18 @@ flask-jwt-extended==4.6.0
 flask-socketio==5.3.6
 flask-limiter==3.6.0
 flask-caching==2.3.0
+flask-compress==1.15          # gzip/br compression on all JSON + CSV responses
 Werkzeug==3.0.3
-flask-compress
 
 # ── ASGI / concurrency ────────────────────────────────────────────────────────
 gunicorn==22.0.0
 eventlet==0.36.1
 
 # ── MongoDB ───────────────────────────────────────────────────────────────────
-pymongo[srv]==4.7.3
-# dnspython included automatically via pymongo[srv]
+pymongo[srv]==4.7.3           # [srv] includes dnspython for mongodb+srv:// Atlas URIs
+dnspython==2.6.1              # explicit pin — SRV DNS resolution for Atlas
 
-# ── Scheduler + HTTP (keep-alive ping) ───────────────────────────────────────
+# ── Scheduler + HTTP client (keep-alive ping) ─────────────────────────────────
 apscheduler==3.10.4
 requests==2.32.3
 
