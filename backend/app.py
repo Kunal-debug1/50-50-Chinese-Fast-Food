@@ -407,7 +407,6 @@ tables_bp = Blueprint("tables", __name__, url_prefix="/tables")
 @tables_bp.get("")
 @cache.cached(timeout=60, key_prefix="all_tables")
 def get_tables():
-    # Projection: only 3 fields fetched; _id serialised to string inline
     docs = get_collection("tables").find({}, _PROJ_TABLE_LIST)
     return jsonify([
         {"id": str(d["_id"]), "number": d["number"], "status": d["status"]}
@@ -469,22 +468,45 @@ def create_order():
 
     table_id = _coerce_table_id(data.get("table_id")) if data.get("table_id") else None
 
-    # Fetch table number once at creation time and store it on the order document.
-    # This eliminates a secondary collection lookup on every admin order list render
-    # — the number is available directly on the order without joining tables.
+    # 🔥 NEW LOGIC: CHECK EXISTING ACTIVE ORDER
+    existing_order = get_collection("orders").find_one({
+        "session_id": session_id,
+        "table_id": table_id,
+        "status": {"$in": ["pending", "preparing", "ready"]}
+    })
+
+    # ✅ IF EXISTS → UPDATE ORDER
+    if existing_order:
+        get_collection("orders").update_one(
+            {"_id": existing_order["_id"]},
+            {
+                "$push": {"items": {"$each": items}},
+                "$inc": {"total": total}
+            }
+        )
+
+        cache.clear()
+        emit_event("order_updated", {"order_id": str(existing_order["_id"])})
+
+        return jsonify(
+            message="Items added to existing order",
+            order_id=str(existing_order["_id"])
+        ), 200
+
+    # 🆕 ELSE CREATE NEW ORDER (UNCHANGED LOGIC)
     table_number = None
     if table_id is not None:
         table_doc = get_collection("tables").find_one(
             _build_table_filter(table_id),
-            _PROJ_TABLE_NUM,            # only fetch the number field
+            _PROJ_TABLE_NUM,
         )
         if table_doc:
             table_number = table_doc.get("number")
 
     doc = {
         "table_id":      table_id,
-        "table_number":  table_number,  # denormalised — avoids join on reads
-        "items":         items,         # native BSON array — no JSON string needed
+        "table_number":  table_number,
+        "items":         items,
         "total":         total,
         "status":        "pending",
         "customer_name": data.get("customer_name"),
@@ -506,7 +528,7 @@ def create_order():
     emit_event("new_order", {"message": "New order received", "order_id": order_id})
     return jsonify(message="Order created successfully", order_id=order_id), 201
 
-
+#--------------------------------------
 @orders_bp.get("")
 @jwt_required()
 @cache.cached(timeout=10, key_prefix="all_orders")
