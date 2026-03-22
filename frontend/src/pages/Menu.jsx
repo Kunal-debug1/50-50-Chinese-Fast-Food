@@ -134,8 +134,8 @@ function Menu() {
     {
     category: "WATER",
       items: [
-        { id: 57, name: "Water Bottle Normal", price: 20, img: "/assets/coffee/water_bottle.jpg" },
-        { id: 58, name: "Water Bottle Cold", price: 20, img: "/assets/coffee/water_bottle.jpg" },
+        { id: 57, name: "Water Bottle Normal", price: 20, img: "/assets/water_bottle.jpg" },
+        { id: 58, name: "Water Bottle Cold", price: 20, img: "/assets/water_bottle.jpg" },
       ],
     },
   ];
